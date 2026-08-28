@@ -1,8 +1,12 @@
 package eu.kanade.tachiyomi.extension.en.dcuniverseinfinite
 
+import android.content.SharedPreferences
 import android.util.Base64
+import androidx.preference.EditTextPreference
+import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
+import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -11,6 +15,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
 import okhttp3.Headers
@@ -24,7 +29,9 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
-class DCUniverseInfinite : HttpSource() {
+class DCUniverseInfinite :
+    HttpSource(),
+    ConfigurableSource {
 
     override val name = "DC Universe Infinite"
     override val baseUrl = "https://www.dcuniverseinfinite.com"
@@ -32,6 +39,8 @@ class DCUniverseInfinite : HttpSource() {
     override val supportsLatest = true
 
     private val apiUrl = "$baseUrl/api"
+
+    private val preferences: SharedPreferences by getPreferencesLazy()
 
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT).apply {
         timeZone = TimeZone.getTimeZone("UTC")
@@ -42,7 +51,15 @@ class DCUniverseInfinite : HttpSource() {
 
     override val client = network.cloudflareClient.newBuilder()
         .addInterceptor { chain ->
-            val request = chain.request()
+            var request = chain.request()
+            if (request.url.host == apiUrl.toHttpUrl().host) {
+                val sessionCookie = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+                if (sessionCookie.isNotEmpty() && request.header("Cookie")?.contains("session=") != true) {
+                    request = request.newBuilder()
+                        .header("Cookie", "session=$sessionCookie")
+                        .build()
+                }
+            }
             val response = chain.proceed(request)
             if ((response.code == 401 || response.code == 403) &&
                 request.url.host == apiUrl.toHttpUrl().host &&
@@ -59,6 +76,18 @@ class DCUniverseInfinite : HttpSource() {
         .set("Referer", "$baseUrl/")
         .set("Origin", baseUrl)
         .set("x-consumer-key", CONSUMER_KEY)
+
+    override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = PREF_SESSION_COOKIE
+            title = "Session cookie"
+            summary = "Paste the value of the 'session' cookie from a signed-in " +
+                "dcuniverseinfinite.com browser tab (DevTools → Application → Cookies). " +
+                "Required if WebView login isn't being picked up. Leave blank to rely on WebView."
+            setDefaultValue("")
+            dialogTitle = "Session cookie value"
+        }.also(screen::addPreference)
+    }
 
     // Popular
 
@@ -219,7 +248,9 @@ class DCUniverseInfinite : HttpSource() {
         val rights = decodeJwtPayload(jwt).parseAs<RightsDto>()
         if (!rights.rights.can_read) {
             val who = if (rights.user_guid.isNullOrBlank()) {
-                "You appear signed out to the server (no account detected). Open WebView, sign in, and let the page fully load before retrying."
+                "The server sees you as signed out. If WebView login isn't sticking " +
+                    "(common on Suwayomi), open the source's Settings and paste your " +
+                    "'session' cookie value from a logged-in browser."
             } else {
                 "Signed in, but this issue isn't readable on your account (it likely needs an active subscription)."
             }
@@ -308,9 +339,11 @@ class DCUniverseInfinite : HttpSource() {
     companion object {
         private const val CONSUMER_KEY = "DA59dtVXYLxajktV"
         private const val PER_PAGE = 20
+        private const val PREF_SESSION_COOKIE = "pref_session_cookie"
         private val JSON_MEDIA_TYPE = "application/json;charset=UTF-8".toMediaType()
         private const val LOGIN_MESSAGE =
-            "Log in via WebView with an active subscription to read this issue."
+            "Not authenticated. Log in via WebView with an active subscription, or paste " +
+                "your 'session' cookie value into the source's Settings."
 
         private val SORTS = listOf(
             SortOption("Newest", "first_released", "desc"),
