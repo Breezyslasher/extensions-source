@@ -53,11 +53,18 @@ class DCUniverseInfinite :
         .addInterceptor { chain ->
             var request = chain.request()
             if (request.url.host == apiUrl.toHttpUrl().host) {
-                val sessionCookie = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
-                if (sessionCookie.isNotEmpty() && request.header("Cookie")?.contains("session=") != true) {
-                    request = request.newBuilder()
-                        .header("Cookie", "session=$sessionCookie")
-                        .build()
+                val token = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+                if (token.isNotEmpty()) {
+                    val b = request.newBuilder()
+                    if (request.header("Authorization").isNullOrEmpty()) {
+                        b.header("Authorization", "Token $token")
+                    }
+                    if (request.header("Cookie")?.contains("session=") != true) {
+                        val existing = request.header("Cookie")
+                        val combined = if (existing.isNullOrEmpty()) "session=$token" else "$existing; session=$token"
+                        b.header("Cookie", combined)
+                    }
+                    request = b.build()
                 }
             }
             val response = chain.proceed(request)
