@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.en.dcuniverseinfinite
 
 import android.content.SharedPreferences
 import android.util.Base64
+import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
@@ -105,29 +106,51 @@ class DCUniverseInfinite :
 
     // Auth
 
-    private fun sessionToken(): String = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+    // Prefer a manually pasted token; otherwise read the (HttpOnly) session cookie that
+    // WebView login stored. The native CookieManager can read HttpOnly cookies; only
+    // JavaScript is blocked from them. This lets WebView login work with no copy-paste.
+    private fun sessionToken(): String {
+        val pasted = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+        if (pasted.isNotEmpty()) return pasted
+        return webViewSessionCookie()
+    }
+
+    private fun webViewSessionCookie(): String = try {
+        CookieManager.getInstance().getCookie(baseUrl).orEmpty()
+            .split(";")
+            .firstOrNull { it.trim().startsWith("session=") }
+            ?.substringAfter("session=")
+            ?.trim()
+            .orEmpty()
+    } catch (_: Exception) {
+        ""
+    }
 
     private fun tokenState(): String {
-        val t = sessionToken()
-        return if (t.isEmpty()) "no pasted token (relying on WebView cookie)" else "pasted token set, ${t.length} chars"
+        val pasted = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+        val wv = webViewSessionCookie()
+        return when {
+            pasted.isNotEmpty() -> "using pasted token (${pasted.length} chars)"
+            wv.isNotEmpty() -> "using WebView session cookie (${wv.length} chars)"
+            else -> "no session found"
+        }
     }
 
     private fun authErrorMessage(): String {
         if (sessionToken().isEmpty()) {
-            return "Not logged in. Open the source's Settings and paste the value of your 'session' " +
-                "cookie from a signed-in dcuniverseinfinite.com browser tab."
+            return "Not logged in. Tap the WebView button on this source and sign in to " +
+                "dcuniverseinfinite.com (solve the captcha), then reopen the chapter."
         }
-        return "Your session token has expired or is invalid. Sign in to dcuniverseinfinite.com in a " +
-            "browser and paste the new 'session' cookie value into the source's Settings."
+        return "Your session has expired. Open WebView, sign in again, then reopen the chapter " +
+            "(or paste a fresh 'session' cookie value in Settings)."
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_SESSION_COOKIE
-            title = "Session cookie"
-            summary = "Paste the value of the 'session' cookie from a signed-in " +
-                "dcuniverseinfinite.com browser tab (DevTools → Application → Cookies). " +
-                "Replace it when the extension says the token has expired."
+            title = "Session cookie (optional)"
+            summary = "Usually not needed — just log in with the WebView button. " +
+                "Only paste a 'session' cookie value here to override WebView login."
             setDefaultValue("")
             dialogTitle = "Session cookie value"
         }.also(screen::addPreference)
