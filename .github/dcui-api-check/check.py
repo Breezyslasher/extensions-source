@@ -163,6 +163,26 @@ def main():
         check("popular_page2", len(p2) > 0 and not overlap and info2.get("current_page") == 2,
               f"{len(p2)} series, current_page={info2.get('current_page')}, overlap with page1={len(overlap)}")
 
+    # Login probe: confirm the request shape is accepted and only the captcha blocks it.
+    # Sends a well-formed login with throwaway credentials and NO captcha field, then
+    # reports exactly how the server responds (fields echoed, not real credentials).
+    login_fields_code, _, login_fields_raw = http("GET", f"{API}/users/login?trans=en")
+    lf = as_json(login_fields_raw) or {}
+    declared = list((lf.get("fields") or {}).keys())
+    info("login_declared_fields", f"HTTP {login_fields_code}, fields the endpoint advertises: {declared}")
+    probe_code, _, probe_raw = http(
+        "POST", f"{API}/users/login?trans=en",
+        body={"email": "probe@example.com", "password": "not-a-real-password"},
+    )
+    probe_body = probe_raw.decode("utf-8", "replace")[:200].replace("\n", " ")
+    arkose = "arkose" in probe_body.lower()
+    info("login_no_captcha_probe",
+         f"POST login with no captcha field -> HTTP {probe_code}; body: {probe_body}")
+    check("login_requires_captcha", probe_code != 200,
+          "server rejects a well-formed login that omits the captcha"
+          + (" (explicitly cites Arkose)" if arkose else ""),
+          required=False)
+
     # Search: verify which key actually filters
     base_uuids = {i["uuid"] for i in p1}
     for key in ("q", "query"):
