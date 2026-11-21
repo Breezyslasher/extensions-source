@@ -1,7 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.dcuniverseinfinite
 
 import android.content.SharedPreferences
-import android.text.InputType
 import android.util.Base64
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
@@ -54,7 +53,7 @@ class DCUniverseInfinite :
         .addInterceptor { chain ->
             var request = chain.request()
             if (request.url.host == apiUrl.toHttpUrl().host) {
-                val token = currentToken(loginIfMissing = false)
+                val token = sessionToken()
                 if (token.isNotEmpty()) {
                     val b = request.newBuilder()
                     if (request.header("Authorization").isNullOrEmpty()) {
@@ -74,7 +73,7 @@ class DCUniverseInfinite :
                 request.url.pathSegments.any { it == "rights" || it == "download" }
             ) {
                 response.close()
-                throw IOException(LOGIN_MESSAGE)
+                throw IOException(authErrorMessage())
             }
             response
         }
@@ -85,73 +84,35 @@ class DCUniverseInfinite :
         .set("Origin", baseUrl)
         .set("x-consumer-key", CONSUMER_KEY)
 
+    init {
+        // Remove credentials saved by an earlier test build that tried password login.
+        preferences.edit()
+            .remove(LEGACY_PREF_EMAIL)
+            .remove(LEGACY_PREF_PASSWORD)
+            .remove(LEGACY_PREF_LOGIN_TOKEN)
+            .apply()
+    }
+
     // Auth
 
-    private fun hasCredentials(): Boolean {
-        val email = preferences.getString(PREF_EMAIL, "").orEmpty()
-        val password = preferences.getString(PREF_PASSWORD, "").orEmpty()
-        return email.isNotBlank() && password.isNotEmpty()
-    }
+    private fun sessionToken(): String = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
 
-    private fun currentToken(loginIfMissing: Boolean): String {
-        if (hasCredentials()) {
-            val token = preferences.getString(PREF_LOGIN_TOKEN, "").orEmpty()
-            if (token.isNotEmpty() || !loginIfMissing) return token
-            return login()
+    private fun authErrorMessage(): String {
+        if (sessionToken().isEmpty()) {
+            return "Not logged in. Open the source's Settings and paste the value of your 'session' " +
+                "cookie from a signed-in dcuniverseinfinite.com browser tab."
         }
-        return preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
-    }
-
-    @Synchronized
-    private fun login(): String {
-        val email = preferences.getString(PREF_EMAIL, "").orEmpty().trim()
-        val password = preferences.getString(PREF_PASSWORD, "").orEmpty()
-        val idKey = if ('@' in email) "email" else "username"
-        val body = """{"$idKey":${email.jsonStr()},"password":${password.jsonStr()}}"""
-        val request = POST("$apiUrl/users/login?trans=en", headers, body.toRequestBody(JSON_MEDIA_TYPE))
-        val token = network.cloudflareClient.newCall(request).execute().use { response ->
-            val raw = response.body.string()
-            if (!response.isSuccessful) {
-                throw IOException("DC Universe Infinite login failed (HTTP ${response.code}): ${raw.take(200)}")
-            }
-            raw.parseAs<LoginDto>().result?.session_id
-                ?: throw IOException("DC Universe Infinite login returned no session: ${raw.take(200)}")
-        }
-        preferences.edit().putString(PREF_LOGIN_TOKEN, token).apply()
-        return token
+        return "Your session token has expired or is invalid. Sign in to dcuniverseinfinite.com in a " +
+            "browser and paste the new 'session' cookie value into the source's Settings."
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
-            key = PREF_EMAIL
-            title = "Email"
-            summary = "Your DC Universe Infinite account email. Used with the password to log in automatically."
-            setDefaultValue("")
-            dialogTitle = "Email"
-            setOnPreferenceChangeListener { _, _ ->
-                preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
-                true
-            }
-        }.also(screen::addPreference)
-        EditTextPreference(screen.context).apply {
-            key = PREF_PASSWORD
-            title = "Password"
-            summary = "Stored on this device only."
-            setDefaultValue("")
-            dialogTitle = "Password"
-            setOnBindEditTextListener {
-                it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
-            }
-            setOnPreferenceChangeListener { _, _ ->
-                preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
-                true
-            }
-        }.also(screen::addPreference)
-        EditTextPreference(screen.context).apply {
             key = PREF_SESSION_COOKIE
-            title = "Session cookie (manual fallback)"
-            summary = "Only used when email/password are empty. Paste the value of the 'session' " +
-                "cookie from a signed-in dcuniverseinfinite.com browser tab."
+            title = "Session cookie"
+            summary = "Paste the value of the 'session' cookie from a signed-in " +
+                "dcuniverseinfinite.com browser tab (DevTools → Application → Cookies). " +
+                "Replace it when the extension says the token has expired."
             setDefaultValue("")
             dialogTitle = "Session cookie value"
         }.also(screen::addPreference)
@@ -297,7 +258,6 @@ class DCUniverseInfinite :
     // Pages
 
     override fun pageListRequest(chapter: SChapter): Request {
-        currentToken(loginIfMissing = true)
         refreshSessionCookie()
         val uuid = (baseUrl + chapter.url).toHttpUrl().pathSegments.last()
         return GET("$apiUrl/5/1/rights/comic/$uuid?trans=en", headers)
@@ -323,20 +283,10 @@ class DCUniverseInfinite :
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        var (jwt, rights) = readRights(response)
-        if (rights.user_guid.isNullOrBlank() && hasCredentials()) {
-            // Stored session expired: log in again and retry once.
-            preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
-            login()
-            refreshSessionCookie()
-            val retry = readRights(client.newCall(GET(response.request.url, headers)).execute())
-            jwt = retry.first
-            rights = retry.second
-        }
+        val (jwt, rights) = readRights(response)
         if (!rights.rights.can_read) {
             val who = if (rights.user_guid.isNullOrBlank()) {
-                "The server sees you as signed out. Enter your email and password in the " +
-                    "source's Settings (or paste your 'session' cookie value)."
+                authErrorMessage()
             } else {
                 "Signed in, but this issue isn't readable on your account (it likely needs an active subscription)."
             }
@@ -428,13 +378,10 @@ class DCUniverseInfinite :
         private const val CONSUMER_KEY = "DA59dtVXYLxajktV"
         private const val PER_PAGE = 20
         private const val PREF_SESSION_COOKIE = "pref_session_cookie"
-        private const val PREF_EMAIL = "pref_email"
-        private const val PREF_PASSWORD = "pref_password"
-        private const val PREF_LOGIN_TOKEN = "pref_login_token"
+        private const val LEGACY_PREF_EMAIL = "pref_email"
+        private const val LEGACY_PREF_PASSWORD = "pref_password"
+        private const val LEGACY_PREF_LOGIN_TOKEN = "pref_login_token"
         private val JSON_MEDIA_TYPE = "application/json;charset=UTF-8".toMediaType()
-        private const val LOGIN_MESSAGE =
-            "Not authenticated. Enter your email and password in the source's Settings, " +
-                "or paste your 'session' cookie value there."
 
         private val SORTS = listOf(
             SortOption("Newest", "first_released", "desc"),

@@ -81,16 +81,6 @@ class CreatorDto(
 )
 
 @Serializable
-class LoginDto(
-    val result: LoginResultDto? = null,
-)
-
-@Serializable
-class LoginResultDto(
-    val session_id: String? = null,
-)
-
-@Serializable
 class RightsDto(
     val rights: RightsInfoDto = RightsInfoDto(),
     val user_guid: String? = null,
