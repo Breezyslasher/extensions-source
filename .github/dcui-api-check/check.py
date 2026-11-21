@@ -173,6 +173,15 @@ def main():
     check("popular_has_next", info1.get("current_page", 1) < info1.get("num_pages", 1),
           f"current_page={info1.get('current_page')} num_pages={info1.get('num_pages')} -> hasNextPage")
 
+    # Does a browse (comicseries) record carry any access/premium signal we could use to
+    # hide fully-locked series cheaply (without fetching each series' chapters)?
+    rec = p1[0]
+    info("series_record_keys", f"comicseries record fields: {sorted(rec.keys())}")
+    for k in ("included_with_premium", "exclusive_to_plans", "available_plans",
+              "available_via_walls_plans", "asset_is_purchasable", "program_schedule"):
+        present = [k in r for r in p1]
+        info("series_access_field", f"{k}: present_on={sum(present)}/{len(p1)}, sample={rec.get(k)}")
+
     p2, info2 = search("popular_page2", page=2)
     if p2 is not None:
         overlap = {i["uuid"] for i in p1} & {i["uuid"] for i in p2}
