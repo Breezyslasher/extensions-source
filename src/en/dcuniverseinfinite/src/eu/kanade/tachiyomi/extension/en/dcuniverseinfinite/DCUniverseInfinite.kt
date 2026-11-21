@@ -1,8 +1,10 @@
 package eu.kanade.tachiyomi.extension.en.dcuniverseinfinite
 
 import android.content.SharedPreferences
+import android.text.InputType
 import android.util.Base64
 import androidx.preference.EditTextPreference
+import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -53,7 +55,7 @@ class DCUniverseInfinite :
         .addInterceptor { chain ->
             var request = chain.request()
             if (request.url.host == apiUrl.toHttpUrl().host) {
-                val token = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+                val token = currentToken(loginIfMissing = false)
                 if (token.isNotEmpty()) {
                     val b = request.newBuilder()
                     if (request.header("Authorization").isNullOrEmpty()) {
@@ -84,13 +86,69 @@ class DCUniverseInfinite :
         .set("Origin", baseUrl)
         .set("x-consumer-key", CONSUMER_KEY)
 
+    // Auth
+
+    private fun hasCredentials(): Boolean =
+        preferences.getString(PREF_EMAIL, "").orEmpty().isNotBlank() &&
+            preferences.getString(PREF_PASSWORD, "").orEmpty().isNotEmpty()
+
+    private fun currentToken(loginIfMissing: Boolean): String {
+        if (hasCredentials()) {
+            val token = preferences.getString(PREF_LOGIN_TOKEN, "").orEmpty()
+            if (token.isNotEmpty() || !loginIfMissing) return token
+            return login()
+        }
+        return preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+    }
+
+    @Synchronized
+    private fun login(): String {
+        val email = preferences.getString(PREF_EMAIL, "").orEmpty().trim()
+        val password = preferences.getString(PREF_PASSWORD, "").orEmpty()
+        val idKey = if ('@' in email) "email" else "username"
+        val body = """{"$idKey":${email.jsonStr()},"password":${password.jsonStr()}}"""
+        val request = POST("$apiUrl/users/login?trans=en", headers, body.toRequestBody(JSON_MEDIA_TYPE))
+        val token = network.cloudflareClient.newCall(request).execute().use { response ->
+            val raw = response.body.string()
+            if (!response.isSuccessful) {
+                throw IOException("DC Universe Infinite login failed (HTTP ${response.code}): ${raw.take(200)}")
+            }
+            raw.parseAs<LoginDto>().result?.session_id
+                ?: throw IOException("DC Universe Infinite login returned no session: ${raw.take(200)}")
+        }
+        preferences.edit().putString(PREF_LOGIN_TOKEN, token).apply()
+        return token
+    }
+
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        val clearToken = Preference.OnPreferenceChangeListener { _, _ ->
+            preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
+            true
+        }
+        EditTextPreference(screen.context).apply {
+            key = PREF_EMAIL
+            title = "Email"
+            summary = "Your DC Universe Infinite account email. Used with the password to log in automatically."
+            setDefaultValue("")
+            dialogTitle = "Email"
+            onPreferenceChangeListener = clearToken
+        }.also(screen::addPreference)
+        EditTextPreference(screen.context).apply {
+            key = PREF_PASSWORD
+            title = "Password"
+            summary = "Stored on this device only."
+            setDefaultValue("")
+            dialogTitle = "Password"
+            setOnBindEditTextListener {
+                it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+            onPreferenceChangeListener = clearToken
+        }.also(screen::addPreference)
         EditTextPreference(screen.context).apply {
             key = PREF_SESSION_COOKIE
-            title = "Session cookie"
-            summary = "Paste the value of the 'session' cookie from a signed-in " +
-                "dcuniverseinfinite.com browser tab (DevTools → Application → Cookies). " +
-                "Required if WebView login isn't being picked up. Leave blank to rely on WebView."
+            title = "Session cookie (manual fallback)"
+            summary = "Only used when email/password are empty. Paste the value of the 'session' " +
+                "cookie from a signed-in dcuniverseinfinite.com browser tab."
             setDefaultValue("")
             dialogTitle = "Session cookie value"
         }.also(screen::addPreference)
@@ -239,30 +297,46 @@ class DCUniverseInfinite :
     // Pages
 
     override fun pageListRequest(chapter: SChapter): Request {
-        // The browser calls set_cookie on every page load before checking rights.
-        // It converts the stored auth token into a fresh HttpOnly session cookie,
-        // without which the rights endpoint returns user_guid=null and can_read=false.
+        currentToken(loginIfMissing = true)
+        refreshSessionCookie()
+        val uuid = (baseUrl + chapter.url).toHttpUrl().pathSegments.last()
+        return GET("$apiUrl/5/1/rights/comic/$uuid?trans=en", headers)
+    }
+
+    // The browser calls set_cookie before every rights check; it turns the auth
+    // token into a fresh HttpOnly session cookie.
+    private fun refreshSessionCookie() {
         runCatching {
             client.newCall(
                 POST("$apiUrl/users/set_cookie?trans=en", headers, "".toRequestBody()),
             ).execute().close()
         }
-        val uuid = (baseUrl + chapter.url).toHttpUrl().pathSegments.last()
-        return GET("$apiUrl/5/1/rights/comic/$uuid?trans=en", headers)
+    }
+
+    private fun readRights(response: Response): Pair<String, RightsDto> {
+        val raw = response.use { it.body.string().trim() }
+        if (response.code != 200) {
+            throw IOException("Rights check failed (HTTP ${response.code}). Check your login in the source's Settings.")
+        }
+        val jwt = raw.removeSurrounding("\"")
+        return jwt to decodeJwtPayload(jwt).parseAs<RightsDto>()
     }
 
     override fun pageListParse(response: Response): List<Page> {
-        val raw = response.body.string().trim()
-        if (response.code != 200) {
-            throw IOException("Rights check failed (HTTP ${response.code}). Open WebView and sign in, then retry.")
+        var (jwt, rights) = readRights(response)
+        if (rights.user_guid.isNullOrBlank() && hasCredentials()) {
+            // Stored session expired: log in again and retry once.
+            preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
+            login()
+            refreshSessionCookie()
+            val retry = readRights(client.newCall(GET(response.request.url, headers)).execute())
+            jwt = retry.first
+            rights = retry.second
         }
-        val jwt = raw.removeSurrounding("\"")
-        val rights = decodeJwtPayload(jwt).parseAs<RightsDto>()
         if (!rights.rights.can_read) {
             val who = if (rights.user_guid.isNullOrBlank()) {
-                "The server sees you as signed out. If WebView login isn't sticking " +
-                    "(common on Suwayomi), open the source's Settings and paste your " +
-                    "'session' cookie value from a logged-in browser."
+                "The server sees you as signed out. Enter your email and password in the " +
+                    "source's Settings (or paste your 'session' cookie value)."
             } else {
                 "Signed in, but this issue isn't readable on your account (it likely needs an active subscription)."
             }
@@ -355,10 +429,13 @@ class DCUniverseInfinite :
         private const val CONSUMER_KEY = "DA59dtVXYLxajktV"
         private const val PER_PAGE = 20
         private const val PREF_SESSION_COOKIE = "pref_session_cookie"
+        private const val PREF_EMAIL = "pref_email"
+        private const val PREF_PASSWORD = "pref_password"
+        private const val PREF_LOGIN_TOKEN = "pref_login_token"
         private val JSON_MEDIA_TYPE = "application/json;charset=UTF-8".toMediaType()
         private const val LOGIN_MESSAGE =
-            "Not authenticated. Log in via WebView with an active subscription, or paste " +
-                "your 'session' cookie value into the source's Settings."
+            "Not authenticated. Enter your email and password in the source's Settings, " +
+                "or paste your 'session' cookie value there."
 
         private val SORTS = listOf(
             SortOption("Newest", "first_released", "desc"),
