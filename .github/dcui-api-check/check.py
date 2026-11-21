@@ -223,6 +223,29 @@ def main():
         check("filter_era", len(era) > 0 and {i["uuid"] for i in era} != base_uuids,
               f"{len(era)} results, sample: {[i.get('title') for i in era[:3]]}")
 
+    # Extra filter keys: probe which ones actually narrow comicseries results.
+    base_total = info1.get("total_result_count", 0)
+
+    def filter_probe(name, filt):
+        body = {"page": 1, "per_page": 20, "document_types": ["comicseries"],
+                "filters": {"comicseries": filt},
+                "sort_field": {"comicseries": "first_released"},
+                "sort_direction": {"comicseries": "desc"}, "apply_transform": True}
+        code, _, raw = http("POST", f"{API}/search_proxy/1/search", body)
+        d = as_json(raw) or {}
+        pinfo = next(iter((d.get("info") or {}).values()), {})
+        items = next(iter((d.get("records") or {}).values()), [])
+        total = pinfo.get("total_result_count")
+        works = isinstance(total, int) and 0 < total < base_total
+        check(name, works,
+              f"filter {filt} -> total={total} (base {base_total}); sample={[i.get('title') for i in items[:3]]}",
+              required=False)
+
+    filter_probe("filter_art_vertical", {"art_style_tags": "Vertical"})
+    filter_probe("filter_char_name", {"character_tags": "Batman"})
+    filter_probe("filter_char_slug", {"character_tags": "batman"})
+    filter_probe("filter_imprint", {"imprints": "DC Black Label"})
+
     # Sort
     srt, _ = search("sort_title_asc", page=1, sort_field="title", sort_dir="asc")
     if srt:
