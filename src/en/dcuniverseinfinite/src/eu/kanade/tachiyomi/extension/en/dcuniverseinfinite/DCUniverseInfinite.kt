@@ -192,14 +192,17 @@ class DCUniverseInfinite :
         sortDirection: String,
         filters: FilterList = FilterList(),
     ): Request {
-        val seriesFilters = buildString {
-            append("{")
-            val era = filters.firstInstanceOrNull<EraFilter>()?.selectedValue
-            if (!era.isNullOrEmpty()) {
-                append(""""eras":${era.jsonStr()}""")
-            }
-            append("}")
+        val filterEntries = buildList {
+            filters.firstInstanceOrNull<EraFilter>()?.selectedValue?.takeIf { it.isNotEmpty() }
+                ?.let { add(""""eras":${it.jsonStr()}""") }
+            filters.firstInstanceOrNull<FormatFilter>()?.selectedValue?.takeIf { it.isNotEmpty() }
+                ?.let { add(""""art_style_tags":${it.jsonStr()}""") }
+            filters.firstInstanceOrNull<CharacterFilter>()?.state?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { add(""""character_tags":${it.jsonStr()}""") }
+            filters.firstInstanceOrNull<ImprintFilter>()?.state?.trim()?.takeIf { it.isNotEmpty() }
+                ?.let { add(""""imprints":${it.jsonStr()}""") }
         }
+        val seriesFilters = "{" + filterEntries.joinToString(",") + "}"
         val body = buildString {
             append("{")
             append(""""page":$page,""")
@@ -258,7 +261,10 @@ class DCUniverseInfinite :
             thumbnail_url = series.base_asset_url?.let { "$it/box.jpg?w=600&auto=format,compress" }
             genre = series.tags
                 .filter { it.categories.none { c -> c.equals("Data Driven", true) } }
-                .joinToString { it.name }
+                .map { it.name }
+                .plus(series.age_rating?.takeIf { it.isNotBlank() })
+                .filterNotNull()
+                .joinToString()
             author = issues.creatorNames { it.authors }
             artist = issues.creatorNames { it.pencillers }
             status = SManga.UNKNOWN
@@ -390,8 +396,12 @@ class DCUniverseInfinite :
     // Filters
 
     override fun getFilterList(): FilterList = FilterList(
+        Filter.Header("Character & Imprint must match DCUI's exact name, e.g. Batman"),
         SortFilter(),
         EraFilter(),
+        FormatFilter(),
+        CharacterFilter(),
+        ImprintFilter(),
     )
 
     private class SortOption(val name: String, val field: String, val direction: String)
@@ -403,6 +413,14 @@ class DCUniverseInfinite :
     private class EraFilter : Filter.Select<String>("Era", ERAS.map { it.first }.toTypedArray()) {
         val selectedValue: String get() = ERAS[state].second
     }
+
+    private class FormatFilter : Filter.Select<String>("Format", FORMATS.map { it.first }.toTypedArray()) {
+        val selectedValue: String get() = FORMATS[state].second
+    }
+
+    private class CharacterFilter : Filter.Text("Character")
+
+    private class ImprintFilter : Filter.Text("Imprint")
 
     // Helpers
 
@@ -452,6 +470,11 @@ class DCUniverseInfinite :
             SortOption("Oldest", "first_released", "asc"),
             SortOption("Title A-Z", "title", "asc"),
             SortOption("Title Z-A", "title", "desc"),
+        )
+
+        private val FORMATS = listOf(
+            "All" to "",
+            "DC GO! (vertical)" to "Vertical",
         )
 
         private val ERAS = listOf(
