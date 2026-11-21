@@ -170,17 +170,21 @@ def main():
     lf = as_json(login_fields_raw) or {}
     declared = list((lf.get("fields") or {}).keys())
     info("login_declared_fields", f"HTTP {login_fields_code}, fields the endpoint advertises: {declared}")
-    probe_code, _, probe_raw = http(
-        "POST", f"{API}/users/login?trans=en",
-        body={"email": "probe@example.com", "password": "not-a-real-password"},
-    )
-    probe_body = probe_raw.decode("utf-8", "replace")[:200].replace("\n", " ")
-    arkose = "arkose" in probe_body.lower()
-    info("login_no_captcha_probe",
-         f"POST login with no captcha field -> HTTP {probe_code}; body: {probe_body}")
-    check("login_requires_captcha", probe_code != 200,
-          "server rejects a well-formed login that omits the captcha"
-          + (" (explicitly cites Arkose)" if arkose else ""),
+    # Try each documented-field variation (no captcha) and show the raw response.
+    probe_variants = [
+        ("email_only", {"email": "probe@example.com", "password": "not-a-real-password"}),
+        ("require_jwt_false", {"email": "probe@example.com", "password": "not-a-real-password", "require_jwt": False}),
+        ("require_jwt_true", {"email": "probe@example.com", "password": "not-a-real-password", "require_jwt": True}),
+        ("username_field", {"username": "probe", "password": "not-a-real-password"}),
+    ]
+    probe_codes = []
+    for label, probe_body_json in probe_variants:
+        code, _, raw = http("POST", f"{API}/users/login?trans=en", body=probe_body_json)
+        body_text = raw.decode("utf-8", "replace")[:200].replace("\n", " ")
+        probe_codes.append(code)
+        info(f"login_probe_{label}", f"fields {list(probe_body_json)} -> HTTP {code}; body: {body_text}")
+    check("login_requires_captcha", all(c != 200 for c in probe_codes),
+          f"every documented-field login without a captcha was rejected (statuses: {probe_codes})",
           required=False)
 
     # Search: verify which key actually filters
