@@ -5,6 +5,7 @@ import android.util.Base64
 import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
 import androidx.preference.PreferenceScreen
+import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
@@ -154,6 +155,13 @@ class DCUniverseInfinite :
             setDefaultValue("")
             dialogTitle = "Session cookie value"
         }.also(screen::addPreference)
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_HIDE_LOCKED
+            title = "Hide chapters you can't read"
+            summary = "Hide issues that need a subscription your account doesn't have. " +
+                "Checks each issue, so chapter lists load slower."
+            setDefaultValue(false)
+        }.also(screen::addPreference)
     }
 
     // Popular
@@ -280,7 +288,23 @@ class DCUniverseInfinite :
             if (result.values.isEmpty()) break
             books.addAll(result.values)
         }
-        return books.mapIndexed { index, book -> book.toSChapter(index) }.reversed()
+        val indexed = books.mapIndexed { index, book -> book to book.toSChapter(index) }
+        val visible = if (preferences.getBoolean(PREF_HIDE_LOCKED, false)) {
+            refreshSessionCookie()
+            indexed.filter { (book, _) -> canRead(book.uuid) }
+        } else {
+            indexed
+        }
+        return visible.map { it.second }.reversed()
+    }
+
+    private fun canRead(bookUuid: String): Boolean = try {
+        val response = client.newCall(GET("$apiUrl/5/1/rights/comic/$bookUuid?trans=en", headers)).execute()
+        val raw = response.use { it.body.string().trim() }
+        response.code == 200 &&
+            decodeJwtPayload(raw.removeSurrounding("\"")).parseAs<RightsDto>().rights.can_read
+    } catch (_: Exception) {
+        false
     }
 
     private fun SeriesBookDto.toSChapter(index: Int): SChapter = SChapter.create().apply {
@@ -417,6 +441,7 @@ class DCUniverseInfinite :
         private const val READER_HOST = "reader.dcuniverseinfinite.com"
         private const val PER_PAGE = 20
         private const val PREF_SESSION_COOKIE = "pref_session_cookie"
+        private const val PREF_HIDE_LOCKED = "pref_hide_locked"
         private const val LEGACY_PREF_EMAIL = "pref_email"
         private const val LEGACY_PREF_PASSWORD = "pref_password"
         private const val LEGACY_PREF_LOGIN_TOKEN = "pref_login_token"
