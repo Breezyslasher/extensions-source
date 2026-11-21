@@ -71,6 +71,13 @@ class SeriesBookDto(
     val issue_number: String? = null,
     val publish_date: String? = null,
     val release_date: String? = null,
+    val authors: List<CreatorDto> = emptyList(),
+    val pencillers: List<CreatorDto> = emptyList(),
+)
+
+@Serializable
+class CreatorDto(
+    val name: String? = null,
 )
 
 @Serializable

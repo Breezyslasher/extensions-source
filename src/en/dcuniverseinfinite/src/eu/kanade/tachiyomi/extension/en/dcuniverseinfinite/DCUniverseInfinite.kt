@@ -182,6 +182,10 @@ class DCUniverseInfinite :
 
     override fun mangaDetailsParse(response: Response): SManga {
         val series = response.parseAs<SeriesDto>()
+        // Series responses carry no creator info; it only exists per issue.
+        val issues = runCatching {
+            client.newCall(seriesBooksRequest(series.uuid, 1)).execute().parseAs<SeriesBooksDto>().values
+        }.getOrDefault(emptyList())
         return SManga.create().apply {
             title = series.title
             description = series.description
@@ -189,7 +193,8 @@ class DCUniverseInfinite :
             genre = series.tags
                 .filter { it.categories.none { c -> c.equals("Data Driven", true) } }
                 .joinToString { it.name }
-            author = series.tags.firstOrNull { it.categories.any { c -> c.equals("Creators", true) } }?.name
+            author = issues.creatorNames { it.authors }
+            artist = issues.creatorNames { it.pencillers }
             status = SManga.UNKNOWN
             initialized = true
         }
@@ -314,6 +319,9 @@ class DCUniverseInfinite :
     }
 
     // Helpers
+
+    private fun List<SeriesBookDto>.creatorNames(select: (SeriesBookDto) -> List<CreatorDto>): String? =
+        flatMap(select).mapNotNull { it.name }.distinct().take(5).joinToString().ifEmpty { null }
 
     private fun decodeJwtPayload(jwt: String): String {
         val payload = jwt.split(".").getOrNull(1)

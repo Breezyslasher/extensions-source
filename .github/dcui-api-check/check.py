@@ -204,8 +204,6 @@ def main():
     tags = best_detail.get("tags", [])
     check("series_tags", isinstance(tags, list) and all("name" in t for t in tags),
           f"{len(tags)} tags, categories seen: {sorted({c for t in tags for c in t.get('categories', [])})}", required=False)
-    creators = [t["name"] for t in tags if "Creators" in t.get("categories", [])]
-    info("series_author_from_tags", f"'Creators' tag present: {bool(creators)} (extension uses it for author)")
 
     # Cover image exactly as the extension builds it
     cover = f"{best['base_asset_url']}/box.jpg?w=600&auto=format,compress"
@@ -233,6 +231,10 @@ def main():
     dated = [b.get("publish_date") or b.get("release_date") for b in books]
     check("chapter_dates", all(d and re.match(r"^\d{4}-\d{2}-\d{2}$", d) for d in dated),
           f"sample dates: {dated[:3]} (extension parses yyyy-MM-dd)")
+    authors = sorted({a.get("name") for b in books for a in b.get("authors", []) if a.get("name")})
+    artists = sorted({a.get("name") for b in books for a in b.get("pencillers", []) if a.get("name")})
+    check("series_creators", bool(authors), f"{len(authors)} authors, {len(artists)} pencillers across issues "
+          f"(extension builds author/artist from these), e.g. {authors[:2]}")
     nums = [b.get("issue_number") for b in books]
     floats = [float(n) for n in nums if n and re.match(r"^-?\d+(\.\d+)?$", n)]
     check("chapter_numbers", len(floats) == len(nums), f"sample issue_number: {nums[:5]}", required=False)
