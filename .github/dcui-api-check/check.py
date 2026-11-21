@@ -279,6 +279,15 @@ def main():
     free_books = list(dict.fromkeys(free_books))
     premium_book = books[-1]["uuid"]
 
+    # List some free-to-read titles anyone can read, and whether rights says can_read anonymously.
+    for uuid in free_books[:6]:
+        code, _, raw = http("GET", f"{API}/comics/1/book/{uuid}/?trans=en")
+        d = as_json(raw) or {}
+        title = d.get("title") or d.get("series_title")
+        rc, _, payload = rights(uuid, auth="none")
+        can_read = payload.get("rights", {}).get("can_read") if payload else None
+        info("free_title", f"'{title}' -> rights can_read(anonymous)={can_read}")
+
     code, _, payload = rights(free_books[0] if free_books else premium_book, auth="none")
     info("rights_anonymous", f"HTTP {code}, can_read={payload and payload.get('rights', {}).get('can_read')}")
 
