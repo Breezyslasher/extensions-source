@@ -1,0 +1,71 @@
+name: DCUI API check
+
+on:
+  push:
+    branches:
+      - claude/add-dc-universe-infinite-source-AeCg3
+    paths:
+      - src/en/dcuniverseinfinite/**
+      - .github/dcui-api-check/**
+      - .github/workflows/dcui_api_check.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  api-check:
+    name: Check live API calls
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Run API checks
+        env:
+          DCUI_SESSION: ${{ secrets.DCUI_SESSION }}
+          REPORT_DIR: dcui-report
+        run: python3 .github/dcui-api-check/check.py
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dcui-api-report
+          path: dcui-report
+          retention-days: 7
+
+  build:
+    name: Build extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5.0.2
+
+      - name: Build
+        run: ./gradlew src:en:dcuniverseinfinite:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dcuniverseinfinite-apk
+          path: src/en/dcuniverseinfinite/build/outputs/apk/**/*.apk
+          retention-days: 7

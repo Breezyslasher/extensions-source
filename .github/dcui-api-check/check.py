@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Replays every DC Universe Infinite API call the extension makes and checks the responses.
+
+Auth checks run only when DCUI_SESSION (the value of the site's `session` cookie) is set.
+Tokens, signed URL query strings and account identifiers are never printed or saved.
+"""
+
+import base64
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+BASE = "https://www.dcuniverseinfinite.com"
+API = BASE + "/api"
+CONSUMER_KEY = "DA59dtVXYLxajktV"
+UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+TOKEN = os.environ.get("DCUI_SESSION", "").strip()
+OUT_DIR = os.environ.get("REPORT_DIR", "dcui-report")
+FREE_COLLECTIONS = ["edt-dcgo-free-to-read", "gtk-johnstewart-free-to-read"]
+SECRET_KEYS = {"user_guid", "guid", "email", "jwt", "session_id", "username", "first_name", "last_name"}
+
+results = []
+
+
+def check(name, ok, detail="", required=True):
+    status = "PASS" if ok else ("FAIL" if required else "WARN")
+    results.append({"name": name, "status": status, "detail": detail})
+    print(f"[{status}] {name}: {detail}", flush=True)
+    return ok
+
+
+def info(name, detail):
+    results.append({"name": name, "status": "INFO", "detail": detail})
+    print(f"[INFO] {name}: {detail}", flush=True)
+
+
+def redact(obj, depth=0):
+    if isinstance(obj, dict):
+        return {k: ("<redacted>" if k in SECRET_KEYS else redact(v, depth + 1)) for k, v in obj.items()}
+    if isinstance(obj, list):
+        out = [redact(v, depth + 1) for v in obj[:2]]
+        if len(obj) > 2:
+            out.append(f"... {len(obj) - 2} more")
+        return out
+    if isinstance(obj, str):
+        if obj.startswith("http") and "?" in obj:
+            return obj.split("?", 1)[0] + "?<query redacted>"
+        if obj.count(".") == 2 and obj.startswith("eyJ"):
+            return "<jwt redacted>"
+    return obj
+
+
+def save_sample(name, data):
+    os.makedirs(os.path.join(OUT_DIR, "samples"), exist_ok=True)
+    with open(os.path.join(OUT_DIR, "samples", f"{name}.json"), "w") as f:
+        json.dump(redact(data), f, indent=2)
+
+
+def http(method, url, body=None, auth="none", extra=None, json_body=True):
+    headers = {"User-Agent": UA}
+    if url.startswith(API):
+        headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "Referer": BASE + "/",
+            "Origin": BASE,
+            "x-consumer-key": CONSUMER_KEY,
+        })
+    else:
+        headers["Referer"] = BASE + "/"
+    if TOKEN and auth in ("both", "token"):
+        headers["Authorization"] = f"Token {TOKEN}"
+    if TOKEN and auth in ("both", "cookie"):
+        headers["Cookie"] = f"session={TOKEN}"
+    if extra:
+        headers.update(extra)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode() if json_body else body
+        headers["Content-Type"] = "application/json;charset=UTF-8"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.headers, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.headers, e.read()
+    except Exception as e:  # network failure, timeout
+        return 0, {}, str(e).encode()
+
+
+def as_json(raw):
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def search_body(page, q=None, q_key="q", sort_field="first_released", sort_dir="desc", era=None):
+    body = {"page": page, "per_page": 20, "document_types": ["comicseries"]}
+    if q:
+        body[q_key] = q
+    body["filters"] = {"comicseries": {"eras": era} if era else {}}
+    body["sort_field"] = {"comicseries": sort_field}
+    body["sort_direction"] = {"comicseries": sort_dir}
+    body["apply_transform"] = True
+    return body
+
+
+def search(name, **kw):
+    code, _, raw = http("POST", f"{API}/search_proxy/1/search", search_body(**kw))
+    data = as_json(raw)
+    if code != 200 or not isinstance(data, dict):
+        snippet = raw[:150].decode("utf-8", "replace").replace("\n", " ")
+        check(name, False, f"HTTP {code}, body: {snippet}")
+        return None, None
+    save_sample(name, data)
+    items = next(iter((data.get("records") or {}).values()), [])
+    page_info = next(iter((data.get("info") or {}).values()), {})
+    return items, page_info
+
+
+def decode_jwt(jwt):
+    part = jwt.split(".")[1]
+    part += "=" * (-len(part) % 4)
+    return json.loads(base64.urlsafe_b64decode(part))
+
+
+def rights(book_uuid, auth):
+    code, _, raw = http("GET", f"{API}/5/1/rights/comic/{book_uuid}?trans=en", auth=auth)
+    if code != 200:
+        return code, None, None
+    jwt = raw.decode().strip().strip('"')
+    try:
+        return code, jwt, decode_jwt(jwt)
+    except Exception:
+        return code, None, None
+
+
+def main():
+    os.makedirs(OUT_DIR, exist_ok=True)
+    print(f"Auth token provided: {'yes' if TOKEN else 'no (auth checks skipped)'}\n")
+
+    # Popular / Latest
+    p1, info1 = search("popular_page1", page=1)
+    if p1 is None:
+        info("blocked", "Search endpoint unreachable from this runner; stopping.")
+        return finish()
+    check("popular_page1", len(p1) > 0 and all(i.get("uuid") and i.get("title") for i in p1),
+          f"{len(p1)} series, page info {info1}")
+    missing = [k for k in ("slug", "base_asset_url", "description") if any(k not in i for i in p1)]
+    check("popular_fields", not missing, f"missing on some records: {missing}" if missing else "uuid/title/slug/base_asset_url/description present", required=False)
+    check("popular_has_next", info1.get("current_page", 1) < info1.get("num_pages", 1),
+          f"current_page={info1.get('current_page')} num_pages={info1.get('num_pages')} -> hasNextPage")
+
+    p2, info2 = search("popular_page2", page=2)
+    if p2 is not None:
+        overlap = {i["uuid"] for i in p1} & {i["uuid"] for i in p2}
+        check("popular_page2", len(p2) > 0 and not overlap and info2.get("current_page") == 2,
+              f"{len(p2)} series, current_page={info2.get('current_page')}, overlap with page1={len(overlap)}")
+
+    # Search: verify which key actually filters
+    base_uuids = {i["uuid"] for i in p1}
+    for key in ("q", "query"):
+        res, rinfo = search(f"search_{key}", page=1, q="batman", q_key=key)
+        if res is None:
+            continue
+        hits = sum("batman" in (i.get("title") or "").lower() for i in res)
+        ratio = hits / len(res) if res else 0
+        changed = {i["uuid"] for i in res} != base_uuids
+        works = bool(res) and changed and ratio >= 0.5
+        check(f"search_key_{key}", works,
+              f"{len(res)} results, {hits} titles contain 'batman', total={rinfo.get('total_result_count')}",
+              required=(key == "q"))
+
+    # Era filter
+    era, _ = search("filter_era_golden", page=1, era="golden-age")
+    if era is not None:
+        check("filter_era", len(era) > 0 and {i["uuid"] for i in era} != base_uuids,
+              f"{len(era)} results, sample: {[i.get('title') for i in era[:3]]}")
+
+    # Sort
+    srt, _ = search("sort_title_asc", page=1, sort_field="title", sort_dir="asc")
+    if srt:
+        titles = [(i.get("title") or "").casefold() for i in srt]
+        in_order = sum(a <= b for a, b in zip(titles, titles[1:]))
+        check("sort_title_asc", in_order >= 0.9 * (len(titles) - 1), f"first titles: {[i.get('title') for i in srt[:3]]}")
+
+    # Series details: pick the popular series with the most issues to exercise pagination
+    best, best_count, best_detail = None, -1, None
+    for item in p1[:10]:
+        code, _, raw = http("GET", f"{API}/comics/1/series/{item['uuid']}/?trans=en")
+        d = as_json(raw)
+        if code == 200 and isinstance(d, dict) and d.get("books_count", 0) > best_count:
+            best, best_count, best_detail = item, d.get("books_count", 0), d
+    if not check("series_details", best_detail is not None and bool(best_detail.get("title")),
+                 f"'{best_detail.get('title') if best_detail else None}' books_count={best_count}"):
+        return finish()
+    save_sample("series_details", best_detail)
+    tags = best_detail.get("tags", [])
+    check("series_tags", isinstance(tags, list) and all("name" in t for t in tags),
+          f"{len(tags)} tags, categories seen: {sorted({c for t in tags for c in t.get('categories', [])})}", required=False)
+    creators = [t["name"] for t in tags if "Creators" in t.get("categories", [])]
+    info("series_author_from_tags", f"'Creators' tag present: {bool(creators)} (extension uses it for author)")
+
+    # Cover image exactly as the extension builds it
+    cover = f"{best['base_asset_url']}/box.jpg?w=600&auto=format,compress"
+    code, headers, raw = http("GET", cover)
+    ctype = headers.get("Content-Type", "") if headers else ""
+    check("cover_image", code == 200 and ctype.startswith("image/"), f"HTTP {code}, {ctype}, {len(raw)} bytes")
+
+    # Chapter list: /series/{uuid}/books/issue paginated
+    books, page, num_pages, total = [], 1, 1, 0
+    while page <= num_pages:
+        code, _, raw = http("GET", f"{API}/comics/1/series/{best['uuid']}/books/issue?page={page}&trans=en")
+        d = as_json(raw)
+        if code != 200 or not isinstance(d, dict):
+            check("chapter_list", False, f"page {page}: HTTP {code}")
+            return finish()
+        if page == 1:
+            save_sample("chapter_list_page1", d)
+        num_pages, total = d.get("num_pages", 1), d.get("total", 0)
+        books.extend(d.get("values", []))
+        page += 1
+    check("chapter_list", len(books) > 0 and len(books) == total,
+          f"{len(books)} books over {num_pages} page(s), API total={total}")
+    bad = [b for b in books if not (b.get("uuid") and b.get("slug") and b.get("title"))]
+    check("chapter_fields", not bad, f"{len(bad)} books missing uuid/slug/title")
+    dated = [b.get("publish_date") or b.get("release_date") for b in books]
+    check("chapter_dates", all(d and re.match(r"^\d{4}-\d{2}-\d{2}$", d) for d in dated),
+          f"sample dates: {dated[:3]} (extension parses yyyy-MM-dd)")
+    nums = [b.get("issue_number") for b in books]
+    floats = [float(n) for n in nums if n and re.match(r"^-?\d+(\.\d+)?$", n)]
+    check("chapter_numbers", len(floats) == len(nums), f"sample issue_number: {nums[:5]}", required=False)
+    ascending = all(a <= b for a, b in zip(dated, dated[1:]) if a and b)
+    check("chapter_order_ascending", ascending,
+          "API returns oldest first, so the extension's reversed() gives newest first" if ascending
+          else "API is NOT oldest-first; the extension's reversed() will show chapters in the wrong order")
+
+    # Free-to-read collections: find a book a free account should be able to read
+    free_books = []
+    for slug in FREE_COLLECTIONS:
+        code, _, raw = http("GET", f"{API}/5/2/collection-items/slug/{slug}?page_size=20&trans=en")
+        d = as_json(raw)
+        if code == 200 and d is not None:
+            save_sample(f"collection_{slug}", d)
+            free_books += re.findall(r"urn:book:([0-9a-f-]{36})", raw.decode("utf-8", "replace"))
+        info(f"collection_{slug}", f"HTTP {code}, {len(set(free_books))} free book uuids found so far")
+    free_books = list(dict.fromkeys(free_books))
+    premium_book = books[-1]["uuid"]
+
+    code, _, payload = rights(free_books[0] if free_books else premium_book, auth="none")
+    info("rights_anonymous", f"HTTP {code}, can_read={payload and payload.get('rights', {}).get('can_read')}")
+
+    if not TOKEN:
+        info("auth", "DCUI_SESSION secret not set; skipping authenticated checks")
+        return finish()
+
+    # Which auth form does the server accept?
+    for mode in ("both", "cookie", "token"):
+        code, _, raw = http("GET", f"{API}/users/me/profile?trans=en", auth=mode)
+        check(f"profile_auth_{mode}", code == 200, f"HTTP {code}", required=(mode == "both"))
+
+    code, headers, _ = http("POST", f"{API}/users/set_cookie?trans=en", body=b"", auth="both", json_body=False)
+    set_cookies = headers.get_all("Set-Cookie") if headers else []
+    info("set_cookie", f"HTTP {code}, returns session cookie: {any(c.startswith('session=') for c in set_cookies or [])}")
+
+    readable = None
+    for uuid in free_books[:5] + [premium_book]:
+        code, jwt, payload = rights(uuid, auth="both")
+        if payload is None:
+            check(f"rights_{uuid[:8]}", False, f"HTTP {code}, could not decode rights JWT")
+            continue
+        can_read = payload.get("rights", {}).get("can_read")
+        signed_in = bool(payload.get("user_guid"))
+        kind = "premium" if uuid == premium_book else "free"
+        check(f"rights_signed_in_{kind}_{uuid[:8]}", signed_in, f"can_read={can_read}, server sees account={signed_in}")
+        if can_read and readable is None:
+            readable = (uuid, jwt)
+
+    if not readable:
+        check("download_manifest", False, "no book returned can_read=true; cannot test page loading", required=False)
+        return finish()
+
+    uuid, jwt = readable
+    pages, page, num_pages = [], 1, 1
+    while page <= num_pages:
+        code, _, raw = http("GET", f"{API}/comics/1/book/download/?page={page}&quality=SD&trans=en",
+                            auth="both", extra={"x-auth-jwt": jwt})
+        d = as_json(raw)
+        if code != 200 or not isinstance(d, dict):
+            check("download_manifest", False, f"page {page}: HTTP {code}")
+            return finish()
+        if page == 1:
+            save_sample("download_manifest_page1", d)
+            check("download_matches_book", d.get("uuid") == uuid, "manifest uuid matches the book the JWT was issued for")
+        num_pages = d.get("num_pages", 1)
+        pages.extend(d.get("images", []))
+        page += 1
+    with_thumb = [p for p in pages if p.get("thumbnail_url")]
+    check("download_manifest", len(pages) > 0 and len(with_thumb) == len(pages),
+          f"{len(pages)} pages over {num_pages} manifest page(s), {len(with_thumb)} with thumbnail_url")
+    numbers = [p.get("page_number") for p in pages]
+    check("page_order", numbers == sorted(numbers), f"page_number sequence starts {numbers[:5]}", required=False)
+
+    code, _, _ = http("GET", f"{API}/comics/1/book/download/?page=1&quality=SD&trans=en", extra={"x-auth-jwt": jwt})
+    info("download_jwt_only", f"HTTP {code} with x-auth-jwt but no session (shows whether the JWT alone is enough)")
+
+    if with_thumb:
+        code, headers, raw = http("GET", with_thumb[0]["thumbnail_url"])
+        ctype = headers.get("Content-Type", "") if headers else ""
+        is_jpeg = raw[:3] == b"\xff\xd8\xff"
+        check("page_image", code == 200 and is_jpeg,
+              f"HTTP {code}, {ctype}, {len(raw)} bytes, JPEG magic={is_jpeg}")
+        dims = [(p.get("width"), p.get("height")) for p in pages[:1]]
+        info("page_image_size", f"manifest lists full page as {dims}; thumbnail fetched is {len(raw)} bytes")
+
+    return finish()
+
+
+def finish():
+    failed = [r for r in results if r["status"] == "FAIL"]
+    with open(os.path.join(OUT_DIR, "report.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    lines = ["## DCUI API check", "", "| Status | Check | Detail |", "|---|---|---|"]
+    lines += [f"| {r['status']} | {r['name']} | {r['detail'].replace('|', '/')} |" for r in results]
+    summary = "\n".join(lines) + "\n"
+    with open(os.path.join(OUT_DIR, "summary.md"), "w") as f:
+        f.write(summary)
+    if os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write(summary)
+    print(f"\n{len(results)} checks, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
