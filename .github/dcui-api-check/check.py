@@ -93,6 +93,22 @@ def http(method, url, body=None, auth="none", extra=None, json_body=True):
         return 0, {}, str(e).encode()
 
 
+def jpeg_size(data):
+    try:
+        i = 2
+        while i < len(data) - 9:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                return (data[i + 7] << 8) | data[i + 8], (data[i + 5] << 8) | data[i + 6]
+            i += 2 + ((data[i + 2] << 8) | data[i + 3])
+    except Exception:
+        pass
+    return None, None
+
+
 def as_json(raw):
     try:
         return json.loads(raw)
@@ -290,6 +306,34 @@ def main():
 
     code, _, payload = rights(free_books[0] if free_books else premium_book, auth="none")
     info("rights_anonymous", f"HTTP {code}, can_read={payload and payload.get('rights', {}).get('can_read')}")
+
+    # Image quality: for a free-readable book, compare the SD vs HD download manifests and
+    # measure the actual thumbnail pixel size (the only unencrypted image we can use).
+    readable = None
+    for uuid in free_books[:8]:
+        _, jwt, payload = rights(uuid, auth="none")
+        if jwt and payload and payload.get("rights", {}).get("can_read"):
+            readable = (uuid, jwt)
+            break
+    if readable:
+        uuid, jwt = readable
+        for q in ("SD", "HD"):
+            code, _, raw = http("GET", f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en",
+                                auth="none", extra={"x-auth-jwt": jwt})
+            d = as_json(raw) or {}
+            imgs = d.get("images", [])
+            if not imgs:
+                info(f"image_{q}", f"HTTP {code}, no images; body: {raw[:120].decode('utf-8', 'replace')}")
+                continue
+            first = imgs[0]
+            turl = first.get("thumbnail_url")
+            surl = first.get("signed_url", "")
+            tcode, _, tbytes = http("GET", turl) if turl else (0, {}, b"")
+            tw, th = jpeg_size(tbytes)
+            enc_name = surl.split("?")[0].rsplit("/", 1)[-1]
+            info(f"image_{q}",
+                 f"manifest page dims {first.get('width')}x{first.get('height')}; "
+                 f"thumbnail {len(tbytes)}B {tw}x{th}px (HTTP {tcode}); encrypted file: {enc_name}")
 
     if not TOKEN:
         info("auth", "DCUI_SESSION secret not set; skipping authenticated checks")
