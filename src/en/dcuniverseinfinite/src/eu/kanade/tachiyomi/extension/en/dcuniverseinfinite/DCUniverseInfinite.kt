@@ -88,9 +88,11 @@ class DCUniverseInfinite :
 
     // Auth
 
-    private fun hasCredentials(): Boolean =
-        preferences.getString(PREF_EMAIL, "").orEmpty().isNotBlank() &&
-            preferences.getString(PREF_PASSWORD, "").orEmpty().isNotEmpty()
+    private fun hasCredentials(): Boolean {
+        val email = preferences.getString(PREF_EMAIL, "").orEmpty()
+        val password = preferences.getString(PREF_PASSWORD, "").orEmpty()
+        return email.isNotBlank() && password.isNotEmpty()
+    }
 
     private fun currentToken(loginIfMissing: Boolean): String {
         if (hasCredentials()) {
@@ -156,15 +158,13 @@ class DCUniverseInfinite :
 
     // Popular
 
-    override fun popularMangaRequest(page: Int): Request =
-        searchRequest(page, null, "first_released", "desc")
+    override fun popularMangaRequest(page: Int): Request = searchRequest(page, null, "first_released", "desc")
 
     override fun popularMangaParse(response: Response): MangasPage = parseSeriesList(response)
 
     // Latest
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        searchRequest(page, null, "first_released", "desc")
+    override fun latestUpdatesRequest(page: Int): Request = searchRequest(page, null, "first_released", "desc")
 
     override fun latestUpdatesParse(response: Response): MangasPage = parseSeriesList(response)
 
@@ -265,8 +265,7 @@ class DCUniverseInfinite :
         return seriesBooksRequest(seriesUuid, 1)
     }
 
-    private fun seriesBooksRequest(seriesUuid: String, page: Int): Request =
-        GET("$apiUrl/comics/1/series/$seriesUuid/books/issue?page=$page&trans=en", headers)
+    private fun seriesBooksRequest(seriesUuid: String, page: Int): Request = GET("$apiUrl/comics/1/series/$seriesUuid/books/issue?page=$page&trans=en", headers)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         var result = response.parseAs<SeriesBooksDto>()
@@ -394,8 +393,7 @@ class DCUniverseInfinite :
 
     // Helpers
 
-    private fun List<SeriesBookDto>.creatorNames(select: (SeriesBookDto) -> List<CreatorDto>): String? =
-        flatMap(select).mapNotNull { it.name }.distinct().take(5).joinToString().ifEmpty { null }
+    private fun List<SeriesBookDto>.creatorNames(select: (SeriesBookDto) -> List<CreatorDto>): String? = flatMap(select).mapNotNull { it.name }.distinct().take(5).joinToString().ifEmpty { null }
 
     private fun decodeJwtPayload(jwt: String): String {
         val payload = jwt.split(".").getOrNull(1)
