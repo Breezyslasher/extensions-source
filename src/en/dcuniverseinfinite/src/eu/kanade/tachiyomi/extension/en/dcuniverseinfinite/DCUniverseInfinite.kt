@@ -68,12 +68,22 @@ class DCUniverseInfinite :
                 }
             }
             val response = chain.proceed(request)
-            if ((response.code == 401 || response.code == 403) &&
-                request.url.host == apiUrl.toHttpUrl().host &&
-                request.url.pathSegments.any { it == "rights" || it == "download" }
-            ) {
-                response.close()
-                throw IOException(authErrorMessage())
+            if (response.code == 401 || response.code == 403) {
+                val host = request.url.host
+                val path = request.url.encodedPath
+                if (host == apiUrl.toHttpUrl().host &&
+                    request.url.pathSegments.any { it == "rights" || it == "download" }
+                ) {
+                    response.close()
+                    throw IOException("${authErrorMessage()} [HTTP ${response.code} at $path; ${tokenState()}]")
+                }
+                if (host == READER_HOST) {
+                    response.close()
+                    throw IOException(
+                        "Image blocked (HTTP ${response.code}) at $path. The signed image URL was " +
+                            "rejected or expired; ${tokenState()}.",
+                    )
+                }
             }
             response
         }
@@ -96,6 +106,11 @@ class DCUniverseInfinite :
     // Auth
 
     private fun sessionToken(): String = preferences.getString(PREF_SESSION_COOKIE, "").orEmpty().trim()
+
+    private fun tokenState(): String {
+        val t = sessionToken()
+        return if (t.isEmpty()) "no pasted token (relying on WebView cookie)" else "pasted token set, ${t.length} chars"
+    }
 
     private fun authErrorMessage(): String {
         if (sessionToken().isEmpty()) {
@@ -286,9 +301,9 @@ class DCUniverseInfinite :
         val (jwt, rights) = readRights(response)
         if (!rights.rights.can_read) {
             val who = if (rights.user_guid.isNullOrBlank()) {
-                authErrorMessage()
+                "${authErrorMessage()} [server sees you signed OUT; ${tokenState()}]"
             } else {
-                "Signed in, but this issue isn't readable on your account (it likely needs an active subscription)."
+                "Signed in as a real account, but this issue isn't readable (needs an active subscription). [${tokenState()}]"
             }
             throw IOException(who)
         }
@@ -376,6 +391,7 @@ class DCUniverseInfinite :
 
     companion object {
         private const val CONSUMER_KEY = "DA59dtVXYLxajktV"
+        private const val READER_HOST = "reader.dcuniverseinfinite.com"
         private const val PER_PAGE = 20
         private const val PREF_SESSION_COOKIE = "pref_session_cookie"
         private const val LEGACY_PREF_EMAIL = "pref_email"
