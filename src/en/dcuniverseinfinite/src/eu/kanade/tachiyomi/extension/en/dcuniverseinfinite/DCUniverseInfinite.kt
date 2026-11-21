@@ -4,7 +4,6 @@ import android.content.SharedPreferences
 import android.text.InputType
 import android.util.Base64
 import androidx.preference.EditTextPreference
-import androidx.preference.Preference
 import androidx.preference.PreferenceScreen
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
@@ -123,17 +122,16 @@ class DCUniverseInfinite :
     }
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val clearToken = Preference.OnPreferenceChangeListener { _, _ ->
-            preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
-            true
-        }
         EditTextPreference(screen.context).apply {
             key = PREF_EMAIL
             title = "Email"
             summary = "Your DC Universe Infinite account email. Used with the password to log in automatically."
             setDefaultValue("")
             dialogTitle = "Email"
-            onPreferenceChangeListener = clearToken
+            setOnPreferenceChangeListener { _, _ ->
+                preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
+                true
+            }
         }.also(screen::addPreference)
         EditTextPreference(screen.context).apply {
             key = PREF_PASSWORD
@@ -144,7 +142,10 @@ class DCUniverseInfinite :
             setOnBindEditTextListener {
                 it.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             }
-            onPreferenceChangeListener = clearToken
+            setOnPreferenceChangeListener { _, _ ->
+                preferences.edit().remove(PREF_LOGIN_TOKEN).apply()
+                true
+            }
         }.also(screen::addPreference)
         EditTextPreference(screen.context).apply {
             key = PREF_SESSION_COOKIE
