@@ -6,6 +6,7 @@ Tokens, signed URL query strings and account identifiers are never printed or sa
 """
 
 import base64
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -61,6 +62,50 @@ def save_sample(name, data):
     os.makedirs(os.path.join(OUT_DIR, "samples"), exist_ok=True)
     with open(os.path.join(OUT_DIR, "samples", f"{name}.json"), "w") as f:
         json.dump(redact(data), f, indent=2)
+
+
+def redact_full(obj):
+    """Redact secrets without dropping any fields or list entries."""
+    if isinstance(obj, dict):
+        return {
+            k: ("<redacted>" if k in SECRET_KEYS else redact_full(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [redact_full(v) for v in obj]
+    if isinstance(obj, str):
+        if obj.startswith("http") and "?" in obj:
+            return obj.split("?", 1)[0] + "?<query redacted>"
+        if obj.count(".") == 2 and obj.startswith("eyJ"):
+            return "<jwt redacted>"
+    return obj
+
+
+def save_download_response(name, request_url, status, headers, raw, quality):
+    """Save the full manifest structure while removing signed URL query tokens."""
+    os.makedirs(os.path.join(OUT_DIR, "responses"), exist_ok=True)
+    parsed = as_json(raw)
+    payload = {
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "request": {
+            "method": "GET",
+            "url": request_url,
+            "quality": quality,
+        },
+        "response": {
+            "status": status,
+            "content_type": headers.get("Content-Type", "") if headers else "",
+            "json": redact_full(parsed) if parsed is not None else None,
+            "body_text": None if parsed is not None else raw.decode("utf-8", "replace"),
+        },
+    }
+    path = os.path.join(OUT_DIR, "responses", f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    images = parsed.get("images", []) if isinstance(parsed, dict) else []
+    info(f"{name}_saved",
+         f"HTTP {status}; saved complete manifest structure ({len(images)} images) "
+         f"to responses/{name}.json; signed URL query strings redacted")
 
 
 def save_enc_sample(name, data, headers, status, truncated=False):
@@ -367,8 +412,12 @@ def main():
     if readable:
         uuid, jwt = readable
         for q in ("SD", "HD"):
-            code, _, raw = http("GET", f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en",
-                                auth="none", extra={"x-auth-jwt": jwt})
+            manifest_url = f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en"
+            code, manifest_headers, raw = http("GET", manifest_url,
+                                               auth="none", extra={"x-auth-jwt": jwt})
+            if q == "HD":
+                save_download_response("download_HD_page1", manifest_url, code,
+                                       manifest_headers, raw, q)
             d = as_json(raw) or {}
             imgs = d.get("images", [])
             if not imgs:
