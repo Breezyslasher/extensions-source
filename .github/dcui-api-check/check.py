@@ -6,6 +6,7 @@ Tokens, signed URL query strings and account identifiers are never printed or sa
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -62,7 +63,23 @@ def save_sample(name, data):
         json.dump(redact(data), f, indent=2)
 
 
-def http(method, url, body=None, auth="none", extra=None, json_body=True):
+def save_enc_sample(name, data, headers, status, truncated=False):
+    """Save a bounded .enc response for format identification; never log its URL or contents."""
+    os.makedirs(os.path.join(OUT_DIR, "samples"), exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    path = os.path.join(OUT_DIR, "samples", f"{safe_name}.enc")
+    if truncated:
+        info(f"{name}_sample", f"HTTP {status}; response exceeded 8 MiB, not saved")
+        return
+    with open(path, "wb") as f:
+        f.write(data)
+    info(f"{name}_sample",
+         f"saved {len(data)} bytes; content-type={headers.get('Content-Type', 'unknown')}; "
+         f"sha256={hashlib.sha256(data).hexdigest()}; "
+         f"first_32_bytes={data[:32].hex()}; artifact file=samples/{safe_name}.enc")
+
+
+def http(method, url, body=None, auth="none", extra=None, json_body=True, max_bytes=None):
     headers = {"User-Agent": UA}
     if url.startswith(API):
         headers.update({
@@ -86,9 +103,9 @@ def http(method, url, body=None, auth="none", extra=None, json_body=True):
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, r.headers, r.read()
+            return r.status, r.headers, r.read(max_bytes + 1 if max_bytes else -1)
     except urllib.error.HTTPError as e:
-        return e.code, e.headers, e.read()
+        return e.code, e.headers, e.read(max_bytes + 1 if max_bytes else -1)
     except Exception as e:  # network failure, timeout
         return 0, {}, str(e).encode()
 
@@ -366,6 +383,15 @@ def main():
             info(f"image_{q}",
                  f"manifest page dims {first.get('width')}x{first.get('height')}; "
                  f"thumbnail {len(tbytes)}B {tw}x{th}px (HTTP {tcode}); encrypted file: {enc_name}")
+            if surl:
+                ecode, eheaders, ebytes = http("GET", surl, max_bytes=8 * 1024 * 1024)
+                too_large = len(ebytes) > 8 * 1024 * 1024
+                if ecode == 200 and not too_large:
+                    save_enc_sample(f"page_{q}", ebytes, eheaders, ecode)
+                else:
+                    info(f"page_{q}_sample",
+                         f"download not saved; HTTP {ecode}; "
+                         f"over_8MiB={too_large}; received_at_least={len(ebytes)} bytes")
 
     if not TOKEN:
         info("auth", "DCUI_SESSION secret not set; skipping authenticated checks")
