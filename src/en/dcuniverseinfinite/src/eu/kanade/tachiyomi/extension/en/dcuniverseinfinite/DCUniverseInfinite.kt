@@ -235,7 +235,7 @@ class DCUniverseInfinite : HttpSource() {
         var numPages = 1
         while (pageNum <= numPages) {
             val request = GET(
-                "$apiUrl/comics/1/book/download/?page=$pageNum&quality=SD&trans=en",
+                "$apiUrl/comics/1/book/download/?page=$pageNum&quality=HD&trans=en",
                 pageHeaders,
             )
             val manifest = client.newCall(request).execute().parseAs<DownloadDto>()
