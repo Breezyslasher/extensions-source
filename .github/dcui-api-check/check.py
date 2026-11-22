@@ -473,6 +473,43 @@ def main():
         return finish()
 
     uuid, jwt = readable
+
+    # Compare SD and HD using the authenticated account session. The earlier
+    # anonymous probe can legitimately receive a lower-tier asset even when
+    # the request parameter says HD, so it must not be used to judge HD support.
+    for q in ("SD", "HD"):
+        manifest_url = f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en"
+        qcode, qheaders, qraw = http(
+            "GET", manifest_url, auth="both", extra={"x-auth-jwt": jwt},
+        )
+        if q == "HD":
+            save_download_response(
+                "download_HD_authenticated_page1", manifest_url,
+                qcode, qheaders, qraw, q,
+            )
+        qdata = as_json(qraw) or {}
+        qimages = qdata.get("images", [])
+        if qcode != 200 or not qimages:
+            info(f"authenticated_image_{q}",
+                 f"HTTP {qcode}; no image entries returned")
+            continue
+        qfirst = qimages[0]
+        qurl = qfirst.get("signed_url")
+        qname = f"page_{q}_authenticated"
+        if qurl:
+            qfile_code, qfile_headers, qfile_bytes = http("GET", qurl, max_bytes=8 * 1024 * 1024)
+            too_large = len(qfile_bytes) > 8 * 1024 * 1024
+            if qfile_code == 200 and not too_large:
+                save_enc_sample(qname, qfile_bytes, qfile_headers, qfile_code)
+            else:
+                info(f"{qname}_sample",
+                     f"not saved; HTTP {qfile_code}; over_8MiB={too_large}; "
+                     f"received_at_least={len(qfile_bytes)} bytes")
+        info(f"authenticated_image_{q}",
+             f"manifest HTTP {qcode}; first page dimensions "
+             f"{qfirst.get('width')}x{qfirst.get('height')}; "
+             f"asset path={qurl.split('?')[0].rsplit('/', 1)[-1] if qurl else 'missing signed_url'}")
+
     pages, page, num_pages = [], 1, 1
     while page <= num_pages:
         code, _, raw = http("GET", f"{API}/comics/1/book/download/?page={page}&quality=SD&trans=en",
