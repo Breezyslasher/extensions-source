@@ -89,6 +89,7 @@ class RightsDto(
 @Serializable
 class RightsInfoDto(
     val can_read: Boolean = false,
+    val hd_available: Boolean = false,
 )
 
 @Serializable
