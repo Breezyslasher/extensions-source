@@ -358,6 +358,12 @@ def main():
                 info(f"image_{q}", f"HTTP {code}, no images; body: {raw[:120].decode('utf-8', 'replace')}")
                 continue
             first = imgs[0]
+            # Dump EVERY field and EVERY url-like value on a page entry, so we can be
+            # certain there is no third (full-res, non-encrypted) image URL we skipped.
+            info(f"image_{q}_manifest_keys", f"top={sorted(d.keys())}; image_entry={sorted(first.keys())}")
+            for k, v in first.items():
+                if isinstance(v, str) and ("http" in v or ".enc" in v or ".jpg" in v or ".webp" in v):
+                    info(f"image_{q}_url", f"{k} -> {v.split('?')[0].rsplit('/', 1)[-1]}")
             turl = first.get("thumbnail_url")
             surl = first.get("signed_url", "")
             tcode, _, tbytes = http("GET", turl) if turl else (0, {}, b"")
