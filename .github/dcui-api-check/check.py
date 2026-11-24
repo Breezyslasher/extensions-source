@@ -6,6 +6,8 @@ Tokens, signed URL query strings and account identifiers are never printed or sa
 """
 
 import base64
+from datetime import datetime, timezone
+import hashlib
 import json
 import os
 import re
@@ -62,7 +64,67 @@ def save_sample(name, data):
         json.dump(redact(data), f, indent=2)
 
 
-def http(method, url, body=None, auth="none", extra=None, json_body=True):
+def redact_full(obj):
+    """Redact secrets without dropping any fields or list entries."""
+    if isinstance(obj, dict):
+        return {
+            k: ("<redacted>" if k in SECRET_KEYS else redact_full(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [redact_full(v) for v in obj]
+    if isinstance(obj, str):
+        if obj.startswith("http") and "?" in obj:
+            return obj.split("?", 1)[0] + "?<query redacted>"
+        if obj.count(".") == 2 and obj.startswith("eyJ"):
+            return "<jwt redacted>"
+    return obj
+
+
+def save_download_response(name, request_url, status, headers, raw, quality):
+    """Save the full manifest structure while removing signed URL query tokens."""
+    os.makedirs(os.path.join(OUT_DIR, "responses"), exist_ok=True)
+    parsed = as_json(raw)
+    payload = {
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "request": {
+            "method": "GET",
+            "url": request_url,
+            "quality": quality,
+        },
+        "response": {
+            "status": status,
+            "content_type": headers.get("Content-Type", "") if headers else "",
+            "json": redact_full(parsed) if parsed is not None else None,
+            "body_text": None if parsed is not None else raw.decode("utf-8", "replace"),
+        },
+    }
+    path = os.path.join(OUT_DIR, "responses", f"{name}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    images = parsed.get("images", []) if isinstance(parsed, dict) else []
+    info(f"{name}_saved",
+         f"HTTP {status}; saved complete manifest structure ({len(images)} images) "
+         f"to responses/{name}.json; signed URL query strings redacted")
+
+
+def save_enc_sample(name, data, headers, status, truncated=False):
+    """Save a bounded .enc response for format identification; never log its URL or contents."""
+    os.makedirs(os.path.join(OUT_DIR, "samples"), exist_ok=True)
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    path = os.path.join(OUT_DIR, "samples", f"{safe_name}.enc")
+    if truncated:
+        info(f"{name}_sample", f"HTTP {status}; response exceeded 8 MiB, not saved")
+        return
+    with open(path, "wb") as f:
+        f.write(data)
+    info(f"{name}_sample",
+         f"saved {len(data)} bytes; content-type={headers.get('Content-Type', 'unknown')}; "
+         f"sha256={hashlib.sha256(data).hexdigest()}; "
+         f"first_32_bytes={data[:32].hex()}; artifact file=samples/{safe_name}.enc")
+
+
+def http(method, url, body=None, auth="none", extra=None, json_body=True, max_bytes=None):
     headers = {"User-Agent": UA}
     if url.startswith(API):
         headers.update({
@@ -86,9 +148,9 @@ def http(method, url, body=None, auth="none", extra=None, json_body=True):
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, r.headers, r.read()
+            return r.status, r.headers, r.read(max_bytes + 1 if max_bytes else -1)
     except urllib.error.HTTPError as e:
-        return e.code, e.headers, e.read()
+        return e.code, e.headers, e.read(max_bytes + 1 if max_bytes else -1)
     except Exception as e:  # network failure, timeout
         return 0, {}, str(e).encode()
 
@@ -350,8 +412,12 @@ def main():
     if readable:
         uuid, jwt = readable
         for q in ("SD", "HD"):
-            code, _, raw = http("GET", f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en",
-                                auth="none", extra={"x-auth-jwt": jwt})
+            manifest_url = f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en"
+            code, manifest_headers, raw = http("GET", manifest_url,
+                                               auth="none", extra={"x-auth-jwt": jwt})
+            if q == "HD":
+                save_download_response("download_HD_page1", manifest_url, code,
+                                       manifest_headers, raw, q)
             d = as_json(raw) or {}
             imgs = d.get("images", [])
             if not imgs:
@@ -372,6 +438,15 @@ def main():
             info(f"image_{q}",
                  f"manifest page dims {first.get('width')}x{first.get('height')}; "
                  f"thumbnail {len(tbytes)}B {tw}x{th}px (HTTP {tcode}); encrypted file: {enc_name}")
+            if surl:
+                ecode, eheaders, ebytes = http("GET", surl, max_bytes=8 * 1024 * 1024)
+                too_large = len(ebytes) > 8 * 1024 * 1024
+                if ecode == 200 and not too_large:
+                    save_enc_sample(f"page_{q}", ebytes, eheaders, ecode)
+                else:
+                    info(f"page_{q}_sample",
+                         f"download not saved; HTTP {ecode}; "
+                         f"over_8MiB={too_large}; received_at_least={len(ebytes)} bytes")
 
     if not TOKEN:
         info("auth", "DCUI_SESSION secret not set; skipping authenticated checks")
@@ -404,6 +479,43 @@ def main():
         return finish()
 
     uuid, jwt = readable
+
+    # Compare SD and HD using the authenticated account session. The earlier
+    # anonymous probe can legitimately receive a lower-tier asset even when
+    # the request parameter says HD, so it must not be used to judge HD support.
+    for q in ("SD", "HD"):
+        manifest_url = f"{API}/comics/1/book/download/?page=1&quality={q}&trans=en"
+        qcode, qheaders, qraw = http(
+            "GET", manifest_url, auth="both", extra={"x-auth-jwt": jwt},
+        )
+        if q == "HD":
+            save_download_response(
+                "download_HD_authenticated_page1", manifest_url,
+                qcode, qheaders, qraw, q,
+            )
+        qdata = as_json(qraw) or {}
+        qimages = qdata.get("images", [])
+        if qcode != 200 or not qimages:
+            info(f"authenticated_image_{q}",
+                 f"HTTP {qcode}; no image entries returned")
+            continue
+        qfirst = qimages[0]
+        qurl = qfirst.get("signed_url")
+        qname = f"page_{q}_authenticated"
+        if qurl:
+            qfile_code, qfile_headers, qfile_bytes = http("GET", qurl, max_bytes=8 * 1024 * 1024)
+            too_large = len(qfile_bytes) > 8 * 1024 * 1024
+            if qfile_code == 200 and not too_large:
+                save_enc_sample(qname, qfile_bytes, qfile_headers, qfile_code)
+            else:
+                info(f"{qname}_sample",
+                     f"not saved; HTTP {qfile_code}; over_8MiB={too_large}; "
+                     f"received_at_least={len(qfile_bytes)} bytes")
+        info(f"authenticated_image_{q}",
+             f"manifest HTTP {qcode}; first page dimensions "
+             f"{qfirst.get('width')}x{qfirst.get('height')}; "
+             f"asset path={qurl.split('?')[0].rsplit('/', 1)[-1] if qurl else 'missing signed_url'}")
+
     pages, page, num_pages = [], 1, 1
     while page <= num_pages:
         code, _, raw = http("GET", f"{API}/comics/1/book/download/?page={page}&quality=SD&trans=en",
