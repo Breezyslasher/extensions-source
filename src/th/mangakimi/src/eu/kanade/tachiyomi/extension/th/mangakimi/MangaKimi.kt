@@ -6,34 +6,24 @@ import android.graphics.Canvas
 import android.graphics.Rect
 import eu.kanade.tachiyomi.multisrc.mangathemesia.MangaThemesia
 import eu.kanade.tachiyomi.source.model.Page
+import keiyoushi.annotation.Source
 import keiyoushi.lib.unpacker.Unpacker
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okio.Buffer
 import org.jsoup.nodes.Document
 import java.io.IOException
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
 
-class MangaKimi :
-    MangaThemesia(
-        "MangaKimi",
-        "https://www.mangakimi.com",
-        "th",
-        dateFormat = SimpleDateFormat("MMMM d, yyyy", Locale("th")).apply {
-            timeZone = TimeZone.getTimeZone("Asia/Bangkok")
-        },
-    ) {
+@Source
+abstract class MangaKimi : MangaThemesia() {
 
-    override val client = super.client.newBuilder()
-        .addNetworkInterceptor(::imageDescrambler)
-        .build()
+    override fun OkHttpClient.Builder.configureClient() = addNetworkInterceptor(::imageDescrambler)
 
     // Pages
     override val pageSelector = "div#readerarea img, #readerarea div.displayImage + script:containsData(p,a,c,k,e,d)"
@@ -77,13 +67,6 @@ class MangaKimi :
             }
         }.mapIndexed { i, url ->
             Page(i, location, url)
-        }
-
-        // We only call countViews if we parsed pages directly to avoid double counting
-        // since the super fallback also calls it.
-        if (pages.isNotEmpty()) {
-            countViews(document)
-            return pages
         }
 
         // Fallback to super method if no pages are found (e.g., for JSON image lists)

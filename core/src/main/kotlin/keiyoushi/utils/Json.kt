@@ -8,6 +8,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import okio.BufferedSource
 import okio.buffer
 import okio.source
 import uy.kohesive.injekt.Injekt
@@ -56,6 +57,15 @@ inline fun <reified T> Response.parseAs(json: Json = jsonInstance, transform: (S
 inline fun <reified T> JsonElement.parseAs(json: Json = jsonInstance): T = json.decodeFromJsonElement(serializer(), this)
 
 /**
+ * Parses a [BufferedSource] into an object of type [T].
+ *
+ * @param json The [Json] instance to use for parsing. Defaults to the injected instance.
+ */
+inline fun <reified T> BufferedSource.parseAs(json: Json = jsonInstance): T = use {
+    json.decodeFromBufferedSource(serializer(), it)
+}
+
+/**
  * Parses a [InputStream] into an object of type [T]
  *
  * @param json The [Json] instance to use for parsing. Defaults to the injected instance.
@@ -73,3 +83,8 @@ inline fun <reified T> T.toJsonString(json: Json = jsonInstance): String = json.
  * Encodes the object to a Response Body.
  */
 inline fun <reified T> T.toJsonRequestBody(json: Json = jsonInstance): RequestBody = toJsonString(json).toRequestBody(JSON_MEDIA_TYPE)
+
+/**
+ * Encodes the object to a [JsonElement].
+ */
+inline fun <reified T> T.toJsonElement(json: Json = jsonInstance): JsonElement = json.encodeToJsonElement(serializer(), this)

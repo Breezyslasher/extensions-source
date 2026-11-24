@@ -1,105 +1,98 @@
 package eu.kanade.tachiyomi.multisrc.mangacatalog
 
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.ParsedHttpSource
-import okhttp3.OkHttpClient
-import okhttp3.Request
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.attrOrNull
+import keiyoushi.utils.textOrNull
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
 
 // Based On the original manga maniac source
 // MangaCatalog is a network of sites for single franshise sites
 
-abstract class MangaCatalog(
-    override val name: String,
-    override val baseUrl: String,
-    override val lang: String,
-) : ParsedHttpSource() {
-    override val client: OkHttpClient = network.cloudflareClient
-
-    override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
+abstract class MangaCatalog : KeiSource() {
 
     open val sourceList = listOf(
-        Pair("$name", "$baseUrl"),
+        name to baseUrl,
     ).sortedBy { it.first }.distinctBy { it.second }
 
-    // Info
+    override val supportsLatest = false
 
-    override val supportsLatest: Boolean = false
+    override suspend fun getPopularManga(page: Int): MangasPage = MangasPage(sourceList.map { popularMangaFromPair(it.first, it.second) }, false)
 
-    // Popular
-    override fun fetchPopularManga(page: Int): Observable<MangasPage> = Observable.just(MangasPage(sourceList.map { popularMangaFromPair(it.first, it.second) }, false))
     private fun popularMangaFromPair(name: String, sourceurl: String): SManga = SManga.create().apply {
         title = name
         url = sourceurl
     }
-    override fun popularMangaRequest(page: Int): Request = throw UnsupportedOperationException()
-    override fun popularMangaNextPageSelector(): String? = throw UnsupportedOperationException()
-    override fun popularMangaSelector(): String = throw UnsupportedOperationException()
-    override fun popularMangaFromElement(element: Element) = throw UnsupportedOperationException()
 
-    // Latest
-    override fun latestUpdatesRequest(page: Int): Request = throw UnsupportedOperationException()
-    override fun latestUpdatesNextPageSelector(): String? = throw UnsupportedOperationException()
-    override fun latestUpdatesSelector(): String = throw UnsupportedOperationException()
-    override fun latestUpdatesFromElement(element: Element): SManga = throw UnsupportedOperationException()
+    override suspend fun getLatestUpdates(page: Int): MangasPage = throw UnsupportedOperationException()
 
-    // Search
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        val mangas = mutableListOf<SManga>()
-        sourceList.map {
-            if (it.first.contains(query)) {
-                mangas.add(popularMangaFromPair(it.first, it.second))
-            }
+    // Romaji titles are only in the slugs
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val slugQuery = query.trim().replace(' ', '-')
+        val mangas = sourceList.filter { (name, mangaUrl) ->
+            name.contains(query, ignoreCase = true) ||
+                mangaUrl.toHttpUrl().pathSegments.getOrNull(1)?.contains(slugQuery, ignoreCase = true) == true
+        }.map { (name, mangaUrl) ->
+            popularMangaFromPair(name, mangaUrl)
         }
-        return Observable.just(MangasPage(mangas, false))
+        return MangasPage(mangas, false)
     }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList) = throw UnsupportedOperationException()
-    override fun searchMangaNextPageSelector() = throw UnsupportedOperationException()
-    override fun searchMangaSelector() = throw UnsupportedOperationException()
-    override fun searchMangaFromElement(element: Element) = throw UnsupportedOperationException()
-
-    // Get Override
-
-    override fun mangaDetailsRequest(manga: SManga): Request = GET(manga.url, headers)
-    override fun chapterListRequest(manga: SManga): Request = GET(manga.url, headers)
-    override fun pageListRequest(chapter: SChapter): Request = GET(chapter.url, headers)
-
-    // Details
-
-    override fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
-        val info = document.select("div.bg-bg-secondary > div.px-6 > div.flex-col").text()
-        title = document.select("div.container > h1").text()
-        description = if ("Description" in info) info.substringAfter("Description").trim() else info
-        thumbnail_url = document.select("div.flex > img").attr("src")
-    }
-    // Chapters
-
-    override fun chapterListSelector(): String = "div.w-full > div.bg-bg-secondary > div.grid"
-    override fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
-        val name1 = element.select(".col-span-4 > a").text()
-        val name2 = element.select(".text-xs:not(a)").text()
-        if (name2 == "") {
-            name = name1
-        } else {
-            name = "$name1 - $name2"
-        }
-        url = element.select(".col-span-4 > a").attr("abs:href")
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host != baseUrl.toHttpUrl().host) return null
+        val path = url.encodedPath.removeSuffix("/")
+        return sourceList.firstOrNull { it.second.toHttpUrl().encodedPath.removeSuffix("/") == path }
+            ?.let { (name, mangaUrl) -> popularMangaFromPair(name, mangaUrl) }
     }
 
-    // Pages
+    // Manga and chapter URLs are stored as absolute URLs
+    override fun getMangaUrl(manga: SManga): String = manga.url
 
-    override fun pageListParse(document: Document): List<Page> = document.select("img[data-src]")
-        .mapIndexed { index, img -> Page(index, imageUrl = img.attr("abs:data-src")) }
+    override fun getChapterUrl(chapter: SChapter): String = chapter.url
 
-    override fun imageUrlParse(document: Document): String = throw UnsupportedOperationException()
+    // Details and chapters come from the same page
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        return SMangaUpdate(mangaDetailsParse(document), chapterListParse(document))
+    }
+
+    open fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
+        val info = document.selectFirst("div.bg-bg-secondary > div.px-6 > div.flex-col")?.textOrNull()
+        title = document.selectFirst("div.container > h1")!!.text()
+        description = info?.substringAfter("Description")?.trim()
+        thumbnail_url = document.selectFirst("div.flex > img")?.attrOrNull("abs:src")
+    }
+
+    open fun chapterListSelector(): String = "div.w-full > div.bg-bg-secondary > div.grid"
+
+    open fun chapterFromElement(element: Element): SChapter = SChapter.create().apply {
+        val link = element.selectFirst(".col-span-4 > a")!!
+        val subtitle = element.selectFirst(".text-xs:not(a)")?.textOrNull()
+        name = listOfNotNull(link.text(), subtitle).joinToString(" - ")
+        url = link.absUrl("href")
+    }
+
+    private fun chapterListParse(document: Document): List<SChapter> = document.select(chapterListSelector()).map { chapterFromElement(it) }
+
+    override suspend fun getPageList(chapter: SChapter): List<Page> = pageListParse(client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup())
+
+    // First page in src, the lazy-loaded rest in data-src
+    open fun pageListParse(document: Document): List<Page> = document.select("img.js-page:not(noscript img), img.pages__img")
+        .mapIndexed { index, img -> Page(index, imageUrl = img.attrOrNull("abs:data-src") ?: img.absUrl("src")) }
 }

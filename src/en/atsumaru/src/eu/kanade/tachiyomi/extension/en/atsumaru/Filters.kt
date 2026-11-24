@@ -2,120 +2,99 @@ package eu.kanade.tachiyomi.extension.en.atsumaru
 
 import eu.kanade.tachiyomi.source.model.Filter
 
-internal class GenreFilter(genres: List<Genre>) :
-    Filter.Group<Filter.TriState>(
-        "Genres",
-        genres.map { genre ->
-            object : Filter.TriState(genre.name) {}
-        },
-    ) {
-    val genreIds = genres.map { it.id }
+internal class TriStateOption(name: String, val id: String, state: Int = STATE_IGNORE) : Filter.TriState(name, state)
+
+internal class CheckBoxOption(name: String, val id: String) : Filter.CheckBox(name)
+
+internal class GenreFilter(genres: List<TriStateOption>) : Filter.Group<TriStateOption>("Genres", genres) {
+    fun ids(triState: Int) = state.filter { it.state == triState }.map { it.id }
 }
 
-internal class TypeFilter(types: List<Type>) :
-    Filter.Group<Filter.CheckBox>(
-        "Manga Type",
-        types.map { type ->
-            object : Filter.CheckBox(type.name, false) {}
-        },
-    ) {
-    val ids = types.map { it.id }
+internal class TagLetterFilter(letter: String, tags: List<TriStateOption>) : Filter.Group<TriStateOption>(letter, tags)
+
+internal class TagFilters(letters: List<TagLetterFilter>) : Filter.Group<TagLetterFilter>("Tags", letters) {
+    fun ids(triState: Int) = state.flatMap { letter -> letter.state.filter { it.state == triState }.map { it.id } }
 }
 
-internal class StatusFilter(statuses: List<Status>) :
-    Filter.Group<Filter.CheckBox>(
-        "Publishing Status",
-        statuses.map { status ->
-            object : Filter.CheckBox(status.name, false) {}
-        },
-    ) {
-    val ids = statuses.map { it.id }
+internal class TypeFilter(types: List<CheckBoxOption>) : Filter.Group<CheckBoxOption>("Manga Type", types) {
+    val selectedIds get() = state.filter { it.state }.map { it.id }
 }
 
-internal class YearFilter : Filter.Text("Year (e.g., 2024)")
+internal class StatusFilter(statuses: List<CheckBoxOption>) : Filter.Group<CheckBoxOption>("Publishing Status", statuses) {
+    val selectedIds get() = state.filter { it.state }.map { it.id }
+}
+
+internal class YearFilter : Filter.Text("Years (e.g., 2019, 2020)")
 
 internal class MinChaptersFilter : Filter.Text("Minimum Chapters")
 
-internal class SortFilter :
-    Filter.Sort(
-        "Sort By",
-        arrayOf("Popularity", "Trending", "Date Added", "Release Date", "Top Rated"),
-        Selection(0, false),
+internal class MaxChaptersFilter : Filter.Text("Maximum Chapters")
+
+internal class SortFilter : Filter.Select<SortOption>("Sort By", SortOption.ALL.toTypedArray()) {
+    val selected get() = values[state]
+}
+
+internal class Timeframe(private val title: String, val value: String) {
+    override fun toString() = title
+}
+
+internal class TimeframeFilter :
+    Filter.Select<Timeframe>(
+        "Timeframe (Popularity, Most Bookmarked, Most Talked About)",
+        arrayOf(Timeframe("All time", "all"), Timeframe("Daily", "daily"), Timeframe("Weekly", "weekly"), Timeframe("Monthly", "monthly")),
     ) {
+    val selected get() = values[state].value
+}
+
+internal class SortOption(
+    private val title: String,
+    private val typesenseSort: String? = null,
+    private val home2Path: String? = null,
+    val supportsTimeframe: Boolean = false,
+) {
+    override fun toString() = title
+
+    // The site's explore page reads these from its search index, unless the timeframe isn't "All time"
+    fun home2Path(timeframe: String) = home2Path?.takeIf { typesenseSort == null || (supportsTimeframe && timeframe != "all") }
+
+    fun typesenseSort(seed: Int) = typesenseSort ?: randomSort(seed)
+
+    // The site's seeded shuffle over its two random index fields
+    private fun randomSort(seed: Int): String {
+        val (first, second) = if (seed % 2 == 0) "shuffleA" to "shuffleB" else "shuffleB" to "shuffleA"
+        return if ((seed ushr 1) and 1 == 1) {
+            "_eval($first:<=$seed):desc,$first:desc,$second:desc"
+        } else {
+            "_eval($first:>=$seed):desc,$first:asc,$second:asc"
+        }
+    }
+
     companion object {
-        val VALUES = arrayOf("views:desc", "trending:desc", "dateAdded:desc", "released:desc", "avgRating:desc")
+        val POPULARITY = SortOption("Popularity", "views:desc", "popular", supportsTimeframe = true)
+        val TOP_RATED = SortOption("Top Rated", "mbRating:desc")
+        val RANDOM = SortOption("Random")
+
+        val ALL = listOf(
+            POPULARITY,
+            SortOption("Trending", "trending:desc"),
+            SortOption("Recently Added", "dateAdded:desc"),
+            SortOption("Release Date", "releaseDate:desc"),
+            TOP_RATED,
+            SortOption("Title", "title:asc"),
+            SortOption("Hot Updates", home2Path = "hotUpdates"),
+            SortOption("Recently Updated", home2Path = "recentlyUpdated"),
+            SortOption("Rising", home2Path = "rising"),
+            SortOption("Hot Arrivals", home2Path = "hotArrivals"),
+            SortOption("Most Bookmarked", home2Path = "mostBookmarked", supportsTimeframe = true),
+            SortOption("Most Talked About", home2Path = "mostTalkedAbout", supportsTimeframe = true),
+            SortOption("Binge-Worthy", home2Path = "bingeWorthy"),
+            SortOption("Most Polarizing", home2Path = "mostPolarizing"),
+            SortOption("Hidden Gems", home2Path = "hiddenGems"),
+            RANDOM,
+        )
     }
 }
 
-internal class AdultFilter : Filter.CheckBox("Show Adult Content", false)
+internal class AdultFilter : Filter.CheckBox("Show Adult Content")
 
 internal class OfficialFilter : Filter.CheckBox("Only Official Translations", false)
-
-internal data class Genre(val name: String, val id: String)
-
-internal data class Type(val name: String, val id: String)
-
-internal data class Status(val name: String, val id: String)
-
-internal fun getGenresList() = listOf(
-    Genre("Action", "Ip0"),
-    Genre("Adult", "oU1"),
-    Genre("Adventure", "wY2"),
-    Genre("Avant Garde", "6n3"),
-    Genre("Award Winning", "6f4"),
-    Genre("Boys Love", "Dw5"),
-    Genre("Comedy", "pr6"),
-    Genre("Doujinshi", "CA7"),
-    Genre("Drama", "ME8"),
-    Genre("Ecchi", "Gf9"),
-    Genre("Erotica", "2S10"),
-    Genre("Fantasy", "yv11"),
-    Genre("Gender Bender", "Zw12"),
-    Genre("Girls Love", "8613"),
-    Genre("Gourmet", "jk14"),
-    Genre("Harem", "hg15"),
-    Genre("Hentai", "d416"),
-    Genre("Historical", "qW17"),
-    Genre("Horror", "NH18"),
-    Genre("Josei", "Uq19"),
-    Genre("Lolicon", "XZ20"),
-    Genre("Mahou Shoujo", "n421"),
-    Genre("Martial Arts", "XO22"),
-    Genre("Mature", "Gi23"),
-    Genre("Mecha", "N824"),
-    Genre("Music", "Eh25"),
-    Genre("Mystery", "Xz26"),
-    Genre("Psychological", "FV27"),
-    Genre("Romance", "Ex28"),
-    Genre("School Life", "Zu29"),
-    Genre("Sci-Fi", "3j30"),
-    Genre("Seinen", "pw31"),
-    Genre("Shotacon", "rv32"),
-    Genre("Shoujo", "4W33"),
-    Genre("Shoujo Ai", "hM34"),
-    Genre("Shounen", "W935"),
-    Genre("Shounen Ai", "DE36"),
-    Genre("Slice of Life", "YX37"),
-    Genre("Smut", "ZB38"),
-    Genre("Sports", "NC39"),
-    Genre("Supernatural", "hT40"),
-    Genre("Suspense", "WM41"),
-    Genre("Thriller", "e742"),
-    Genre("Tragedy", "tn43"),
-    Genre("Yaoi", "7D44"),
-    Genre("Yuri", "po45"),
-)
-
-internal fun getTypesList() = listOf(
-    Type("Manga", "Manga"),
-    Type("Manhwa", "Manwha"),
-    Type("Manhua", "Manhua"),
-    Type("OEL", "OEL"),
-)
-
-internal fun getStatusList() = listOf(
-    Status("Ongoing", "Ongoing"),
-    Status("Completed", "Completed"),
-    Status("Hiatus", "Hiatus"),
-    Status("Canceled", "Canceled"),
-)

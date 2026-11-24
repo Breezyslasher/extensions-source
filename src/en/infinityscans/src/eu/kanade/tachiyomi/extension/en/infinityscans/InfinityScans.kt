@@ -1,273 +1,274 @@
 package eu.kanade.tachiyomi.extension.en.infinityscans
 
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.extractNextJs
+import keiyoushi.utils.extractNextJsRsc
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
+import keiyoushi.utils.toJsonRequestBody
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.Response
 import org.jsoup.nodes.Element
-import rx.Observable
 
-class InfinityScans : HttpSource() {
+@Source
+abstract class InfinityScans : KeiSource() {
+    private val cdnHost = "cv.infinityscans.org"
 
-    override val name = "InfinityScans"
+    private val pageCdnHost = "ch.infinityscans.org"
 
-    override val baseUrl = "https://infinityscans.org"
-    private val cdnHost = "cdn.infinityscans.org"
+    private var slugHash: String
+        get() = preferences.getString(PREF_SLUG_HASH, DEFAULT_SLUG_HASH) ?: DEFAULT_SLUG_HASH
+        set(value) = preferences.edit().putString(PREF_SLUG_HASH, value).apply()
 
-    override val lang = "en"
+    private var actionId: String
+        get() = preferences.getString(PREF_ACTION_ID, DEFAULT_ACTION_ID) ?: DEFAULT_ACTION_ID
+        set(value) = preferences.edit().putString(PREF_ACTION_ID, value).apply()
 
-    override val supportsLatest = true
-
-    override val client: OkHttpClient = network.cloudflareClient.newBuilder()
-        .addInterceptor(WebviewInterceptor(baseUrl))
-        .rateLimit(1)
-        .build()
-
-    override fun headersBuilder() = super.headersBuilder().apply {
-        add("Referer", "$baseUrl/")
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addInterceptor(WebviewInterceptor(baseUrl))
+        rateLimit(5)
     }
 
-    private val apiHeaders = headersBuilder().apply {
-        add("Accept", "application/json, text/javascript, */*; q=0.01")
-        add("Sec-Fetch-Dest", "empty")
-        add("Sec-Fetch-Mode", "cors")
-        add("Sec-Fetch-Site", "same-origin")
-        add("X-requested-with", "XMLHttpRequest")
-    }.build()
+    private val rscHeaders
+        get() = headersBuilder().set("rsc", "1").build()
 
-    // ============================== Popular ==============================
+    private val apiHeaders
+        get() = headersBuilder().apply {
+            add("Accept", "application/json, text/javascript, */*; q=0.01")
+            add("X-requested-with", "XMLHttpRequest")
+        }.build()
 
-    override fun popularMangaRequest(page: Int): Request = fetchJson("api/ranking")
+    private val preferences by getPreferencesLazy()
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val data = response.parseAs<ResponseDto<RankingResultDto>>().result
-        val entries = data.weekly
-            .map { it.toSManga(cdnHost) }
+    // ============================== Popular + Latest ==============================
 
-        return MangasPage(entries, false)
-    }
+    override suspend fun getPopularManga(page: Int): MangasPage = getMangaList(page, SortType.Popularity.value)
 
-    // ============================== Latest ===============================
+    override suspend fun getLatestUpdates(page: Int): MangasPage = getMangaList(page, SortType.Latest.value)
 
-    override fun latestUpdatesRequest(page: Int): Request = fetchJson("api/comics")
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val data = response.parseAs<ResponseDto<SearchResultDto>>().result
-        runCatching { updateFilters(data) }
-
-        val entries = data.titles.sortedByDescending { it.updated }
-            .map { it.toSManga(cdnHost) }
-
-        return MangasPage(entries, false)
+    private suspend fun getMangaList(page: Int, sort: String): MangasPage {
+        val response = client.get("$baseUrl/api/comics?page=$page&sort=$sort", apiHeaders, Fetch.XHR)
+        val data = response.parseAs<SearchResultDto>()
+        val entries = data.titles.map { it.toSManga(cdnHost) }
+        return MangasPage(entries, entries.isNotEmpty())
     }
 
     // ============================== Search ===============================
 
-    override fun fetchSearchManga(
-        page: Int,
-        query: String,
-        filters: FilterList,
-    ): Observable<MangasPage> = client.newCall(fetchJson("api/comics"))
-        .asObservableSuccess()
-        .map { response ->
-            val data = response.parseAs<ResponseDto<SearchResultDto>>().result
-            runCatching { updateFilters(data) }
-            var titles = data.titles
-
-            if (query.isNotBlank()) {
-                titles = titles.filter { it.title.contains(query, ignoreCase = true) }
-            }
-
-            filters.forEach { filter ->
-                when (filter) {
-                    is SortFilter -> {
-                        when (filter.selected) {
-                            "title" -> titles = titles.sortedBy { it.title }
-                            "popularity" -> titles = titles.sortedByDescending { it.allViews }
-                            "latest" -> titles = titles.sortedByDescending { it.updated }
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val response = if (query.isBlank()) {
+            val url = "$baseUrl/api/comics".toHttpUrl().newBuilder().apply {
+                addQueryParameter("page", page.toString())
+                filters.forEach { filter ->
+                    when (filter) {
+                        is SortFilter -> filter.selected?.let { addQueryParameter("sort", it) }
+                        is GenreFilter -> filter.checked?.let { genres ->
+                            genres.forEach { addQueryParameter("genre", it) }
                         }
-                    }
-
-                    is GenreFilter -> {
-                        val checkedGenres = filter.checked
-                        if (checkedGenres != null) {
-                            titles = titles.filter {
-                                it.genres?.split(",")?.any { genre -> genre in checkedGenres } ?: true
-                            }
+                        is AuthorFilter -> filter.checked?.let { authors ->
+                            authors.forEach { addQueryParameter("author", it) }
                         }
+                        is StatusFilter -> filter.checked.firstOrNull()?.let { addQueryParameter("status", it) }
+                        else -> {}
                     }
-
-                    is AuthorFilter -> {
-                        val checkedAuthors = filter.checked
-                        if (checkedAuthors != null) {
-                            titles = titles.filter {
-                                it.authors?.split(",")?.any { author -> author in checkedAuthors } ?: true
-                            }
-                        }
-                    }
-
-                    is StatusFilter -> {
-                        val checkedStatuses = filter.checked
-                        if (checkedStatuses != null) {
-                            titles = titles.filter { it.status in checkedStatuses }
-                        }
-                    }
-
-                    else -> { /* Do Nothing */ }
                 }
-            }
-
-            val entries = titles.map { it.toSManga(cdnHost) }
-
-            MangasPage(entries, false)
+            }.build()
+            client.get(url, apiHeaders, Fetch.XHR)
+        } else {
+            val body = SearchRequestBody(search = query).toJsonRequestBody()
+            client.post("$baseUrl/api/search", apiHeaders, Fetch.XHR, body)
         }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = throw UnsupportedOperationException()
-
-    override fun searchMangaParse(response: Response): MangasPage = throw UnsupportedOperationException()
-
-    // ============================== Details ==============================
-
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.use { it.asJsoup() }
-
-        val desc = document.select("div:has(>h4:contains(Summary)) p")
-            .text()
-            .split("</br>")
-            .joinToString("\n", transform = String::trim)
-
-        val details = document.selectFirst("div:has(>span:contains(Rank:))")?.parent()
-
-        return SManga.create().apply {
-            description = buildString {
-                append(desc)
-                details?.getInfo("Alternative Titles")?.let {
-                    append("\n\nAlternative Title: ")
-                    append(it)
-                }
-            }
-            author = details?.getLinks("Authors")
-            genre = details?.getLinks("Genres")
-            status = details?.getInfo("Status").parseStatus()
+        return if (query.isNotEmpty()) {
+            val list = response.parseAs<ResponseDto<List<SearchEntryDto>>>().result
+            val mangas = list.map { it.toSManga(cdnHost) }
+            MangasPage(mangas, false)
+        } else {
+            val data = response.parseAs<SearchResultDto>()
+            val mangas = data.titles.map { it.toSManga(cdnHost) }
+            MangasPage(mangas, mangas.isNotEmpty())
         }
     }
 
-    // ============================= Chapters ==============================
+    // ============================== Details ==============================
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val url = response.request.url
-        val slug = url.pathSegments.take(3).joinToString("/", prefix = "/")
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        val pathSegments = url.pathSegments
+        if (pathSegments.size < 3) return null
+        val id = pathSegments[1]
+        val slug = pathSegments[2]
 
-        val chapterHeaders = apiHeaders.newBuilder().apply {
-            add("content-length", "0")
-            add("Origin", baseUrl)
-            set("Referer", url.toString())
-        }.build()
+        val html = client.get(url, rscHeaders, Fetch.XHR).body.string()
+        return parseMangaDetails(html)
+    }
 
-        val chapterListData = client.newCall(
-            POST(url.toString(), chapterHeaders),
-        ).execute().parseAs<ResponseDto<List<ChapterEntryDto>>>()
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/comic/${manga.url}-$slugHash"
 
-        return chapterListData.result.map {
-            it.toSChapter(slug)
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate = SMangaUpdate(
+        manga = { if (fetchDetails) getMangaDetails(manga) else manga },
+        chapters = { if (fetchChapters) getChapterList(manga) else chapters },
+    )
+
+    private suspend fun getMangaDetails(manga: SManga): SManga {
+        val url = "$baseUrl/comic/${manga.url}-$slugHash"
+        val html = client.get(url, rscHeaders, Fetch.XHR).body.string()
+        return runCatching { parseMangaDetails(html) }
+            .getOrElse {
+                val newHash = HASH_REGEX.find(html)?.groupValues?.get(1) ?: error("Failed to find slug hash")
+                slugHash = newHash
+                val newHtml = client.get("$baseUrl/comic/${manga.url}-$slugHash", rscHeaders, Fetch.XHR).body.string()
+                parseMangaDetails(newHtml)
+            }
+    }
+
+    private fun parseMangaDetails(responseHtml: String): SManga {
+        val dto = responseHtml.extractNextJsRsc<MangaDetailsDto>()!!
+        return SManga.create().apply {
+            url = dto.uri.substringAfter("/")
+            title = dto.name
+            description = buildString {
+                dto.description.content
+                    .firstOrNull()
+                    ?.content
+                    ?.joinToString(" ") { it.text }
+                    .orEmpty()
+                    .let { append(it) }
+
+                dto.altNames?.takeIf { it.isNotEmpty() }?.let {
+                    append("\n\nAlternative Title: ")
+                    append(it.joinToString(" · "))
+                }
+            }
+            author = dto.authors.joinToString { it.name }
+            genre = dto.genres.joinToString { it.name }
+            status = dto.status.parseStatus()
+            thumbnail_url = "https://$cdnHost/${dto.cover}"
         }
+    }
+
+    private suspend fun getChapterList(manga: SManga) = coroutineScope {
+        val id = manga.url.substringBefore("/")
+        val first = client.get("$baseUrl/api/comic/$id/chapters?page=0", Fetch.XHR).parseAs<ChapterListDto>()
+
+        val all = first.chapters.toMutableList()
+        if (first.total > first.chapters.size) {
+            val chunkSize = first.chapters.size
+            val totalPages = (first.total + chunkSize - 1) / chunkSize
+
+            (1 until totalPages).map { page ->
+                async {
+                    client.get("$baseUrl/api/comic/$id/chapters?page=$page", Fetch.XHR)
+                        .parseAs<ChapterListDto>().chapters
+                }
+            }.awaitAll().forEach { all.addAll(it) }
+        }
+        all.map { it.toSChapter("comic/$id") }
     }
 
     // =============================== Pages ===============================
 
-    override fun pageListParse(response: Response): List<Page> {
-        val url = response.request.url
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterId = chapter.url.substringAfterLast('/')
+        val mangaId = chapter.url.split("/")[1]
 
-        val pageListHeaders = apiHeaders.newBuilder().apply {
-            add("content-length", "0")
-            add("Origin", baseUrl)
-            set("Referer", url.toString())
-        }.build()
+        val body = listOf(mangaId, chapterId).toJsonRequestBody()
+        // Dummy slug for server to trigger empty set-cookie if expired, baseUrl alone doesn't.
+        val pagesUrl = "$baseUrl/comic/$mangaId/dummy-slug/chapter/$chapterId"
+        val response = getPages(pagesUrl, body)
 
-        val pageListData = client.newCall(
-            POST(url.toString(), pageListHeaders),
-        ).execute().parseAs<ResponseDto<List<PageEntryDto>>>()
-
-        return pageListData.result.mapIndexed { index, p ->
-            Page(index, imageUrl = p.link)
-        }
+        val pages = response.extractNextJs<List<PageEntryDto>>()
+        return pages?.mapIndexed { index, p ->
+            Page(index, imageUrl = "https://$pageCdnHost/${p.path}")
+        } ?: emptyList()
     }
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    private suspend fun getPages(url: String, body: RequestBody): Response {
+        suspend fun post() = client.post(
+            url,
+            headersBuilder().set("next-action", actionId).build(),
+            Fetch.DOCUMENT,
+            body,
+            ensureSuccess = false,
+        )
 
-    override fun imageRequest(page: Page): Request {
-        val pageHeaders = headersBuilder().apply {
-            add("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*")
-            add("Host", page.imageUrl!!.toHttpUrl().host)
-        }.build()
+        post().let {
+            if (it.code != 404) return it
+            it.close()
+        }
 
-        return GET(page.imageUrl!!, pageHeaders)
+        for (
+        src in client.get(url, headers, Fetch.DOCUMENT).asJsoup()
+            .select("script[src*=.js]").eachAttr("abs:src").distinct()
+        ) {
+            val js = client.get(src, headers, Fetch.DOCUMENT).body.string()
+
+            for (match in ACTION_HASH_REGEX.findAll(js)) {
+                val id = match.groupValues[1]
+                actionId = id
+                post().let {
+                    if (it.code != 404) return it
+                    it.close()
+                }
+            }
+        }
+
+        error("No working action ID")
     }
 
     // ============================== Filters ==============================
 
-    private fun updateFilters(data: SearchResultDto) {
-        data.genres?.also { genreDto ->
-            genreList = genreDto.map { Pair(it.title, it.id.toString()) }
-        }
+    override val supportsFilterFetching = true
 
-        data.authors?.also { authorDto ->
-            authorList = authorDto.map { Pair(it.title, it.id.toString()) }
-        }
-
-        data.statuses?.also { status ->
-            statusList = status.map { Pair(it, it) }
-        }
+    override suspend fun fetchFilterData(): JsonElement {
+        // load genre and author filters
+        val response = client.get("$baseUrl/api/comics/options", apiHeaders, Fetch.XHR)
+        return response.parseAs<FiltersDto>().toJsonElement()
     }
 
-    private var genreList: List<Pair<String, String>> = emptyList()
-    private var authorList: List<Pair<String, String>> = emptyList()
-    private var statusList: List<Pair<String, String>> = emptyList()
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val dto = data?.parseAs<FiltersDto>()
 
-    override fun getFilterList(): FilterList {
-        val filters: MutableList<Filter<*>> = mutableListOf(
+        val filters = mutableListOf<Filter<*>>(
+            Filter.Header("Filtering is ignored when searching by text."),
             SortFilter(),
+            StatusFilter(),
         )
 
-        if (genreList.isNotEmpty() || authorList.isNotEmpty() || statusList.isNotEmpty()) {
-            if (genreList.isNotEmpty()) filters += listOf(GenreFilter("Genres", genreList))
-            if (authorList.isNotEmpty()) filters += listOf(AuthorFilter("Authors", authorList))
-            if (statusList.isNotEmpty()) filters += listOf(StatusFilter("Statuses", statusList))
-        } else {
-            filters += listOf(
-                Filter.Separator(),
-                Filter.Header("Press 'reset' to attempt to show additional filters"),
-            )
+        dto?.let {
+            if (dto.genres.isNotEmpty()) filters += GenreFilter("Genres", dto.genres.map { it.name to it.id })
+            if (dto.authors.isNotEmpty()) filters += AuthorFilter("Authors", dto.authors.map { it.name to it.id })
         }
 
         return FilterList(filters)
     }
 
     // ============================= Utilities =============================
-
-    private fun fetchJson(api: String): Request {
-        val url = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegments(api)
-
-        val searchHeaders = apiHeaders.newBuilder().apply {
-            set("Referer", url.build().newBuilder().removePathSegment(0).build().toString())
-        }.build()
-
-        return GET(url.build(), searchHeaders)
-    }
 
     private fun String?.parseStatus(): Int = when {
         this == null -> SManga.UNKNOWN
@@ -283,4 +284,14 @@ class InfinityScans : HttpSource() {
     private fun Element.getLinks(name: String): String? = select("div:has(>span:matches($name:)) a")
         .joinToString(transform = Element::text)
         .takeIf { it.isNotEmpty() }
+
+    companion object {
+        private const val DEFAULT_SLUG_HASH = "d806990541c8"
+        private const val DEFAULT_ACTION_ID = "60610a8a90f941d06db8af699e17f246116e26badf"
+        private const val PREF_SLUG_HASH = "pref_slug_hash"
+        private const val PREF_ACTION_ID = "pref_action_id"
+
+        private val HASH_REGEX = Regex("NEXT_REDIRECT.*https.+?-(\\w+);")
+        private val ACTION_HASH_REGEX = Regex("""createServerReference\)\(\W(\w+)""")
+    }
 }

@@ -1,24 +1,10 @@
 package eu.kanade.tachiyomi.extension.ru.desu
 
 import kotlinx.serialization.Serializable
-
 @Serializable
-class SeriesWrapperDto<T>(
-    val response: T,
+class InfoWrapperDto<T>(
+    val manga: T,
 )
-
-@Serializable
-class PageWrapperDto<T>(
-    val pageNavParams: NavDto,
-    val response: List<T>,
-) {
-    @Serializable
-    class NavDto(
-        val count: Int,
-        val page: Int,
-        val limit: Int,
-    )
-}
 
 @Serializable
 class MangaDetDto(
@@ -27,17 +13,35 @@ class MangaDetDto(
     val russian: String,
     val kind: String?,
     val description: String?,
-    val score: Float?,
-    val score_users: Long?,
-    val age_limit: String?,
-    val synonyms: String?,
-    val image: ImgDto,
+    val score: ScoreDto?,
+    val content_rating: String?,
+    val synonyms: List<String>?,
+    val cover: ImgDto,
     val trans_status: String?,
     val status: String?,
+
+    val genres: List<GenreDto>? = null,
+    val authors: List<AuthorDto>? = null,
 ) {
     @Serializable
+    class ScoreDto(
+        val value: Float?,
+        val votes: Long?,
+    )
+
+    @Serializable
     class ImgDto(
-        val original: String?,
+        val preview: String?,
+    )
+
+    @Serializable
+    class GenreDto(
+        val name: String,
+    )
+
+    @Serializable
+    class AuthorDto(
+        val name: String,
     )
 }
 
@@ -47,7 +51,7 @@ class MangaDetGenresDto(
 ) {
     @Serializable
     class TagsDto(
-        val russian: String,
+        val name: String,
     )
 }
 
@@ -57,6 +61,44 @@ class MangaDetAuthorsDto(
 ) {
     @Serializable
     class PeopleDto(
-        val people_name: String,
+        val name: String,
     )
 }
+
+@Serializable
+class SeriesWrapperDto<T>(
+    val chapters: T,
+)
+
+@Serializable
+class ChaptersDto(
+    val id: Long,
+    val volume: String,
+    val number: String,
+    val title: String?,
+    val publish_date: Long,
+    val status: String,
+    val is_readable: Boolean,
+    val view_url: String,
+)
+
+@Serializable
+class ChapterWrapperDto<T>(
+    val chapter: T,
+)
+
+@Serializable
+class ChapterDataDto(
+    val pages: List<ChapterPageDto>,
+)
+
+@Serializable
+class ChapterPageDto(
+    val url: String,
+)
+
+// Відповідь пошуку /manga/search/: HTML-фрагмент у полі templateHtml
+@Serializable
+class SearchDto(
+    val templateHtml: String,
+)

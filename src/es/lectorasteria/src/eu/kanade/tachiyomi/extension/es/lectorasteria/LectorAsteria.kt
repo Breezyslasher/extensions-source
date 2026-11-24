@@ -1,17 +1,18 @@
 package eu.kanade.tachiyomi.extension.es.lectorasteria
 
 import eu.kanade.tachiyomi.multisrc.moonlighttl.MoonlightTL
-import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
+import eu.kanade.tachiyomi.source.model.Page
+import keiyoushi.annotation.Source
+import keiyoushi.network.rateLimit
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import org.jsoup.nodes.Document
 
-class LectorAsteria :
-    MoonlightTL(
-        "Lector Asteria",
-        "https://lectorasteria.com",
-        "es",
-    ) {
+@Source
+abstract class LectorAsteria : MoonlightTL() {
+    override fun OkHttpClient.Builder.configureClient() = rateLimit(2) { it.host == baseUrl.toHttpUrl().host }
 
-    override val client = super.client.newBuilder()
-        .rateLimitHost(baseUrl.toHttpUrl(), 2)
-        .build()
+    override suspend fun pageListParse(document: Document): List<Page> = document.select("main > div > img.block").mapIndexed { i, element ->
+        Page(i, imageUrl = element.attr("abs:src"))
+    }
 }

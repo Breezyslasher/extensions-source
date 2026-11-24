@@ -6,8 +6,26 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 class ResultDto<T>(
-    val result: T,
+    val result: T? = null,
+    val status: Boolean? = null,
+    val errorCode: Int? = null,
+    private val messages: ErrorMessagesDto? = null,
+) {
+    val errorMessage: String? get() = messages?.messages?.firstOrNull()
+}
+
+@Serializable
+class ErrorMessagesDto(
+    val messages: List<String>? = null,
 )
+
+@Serializable
+class CategoryDto(
+    private val id: String,
+    private val name: String,
+) {
+    fun toOption() = Option(name, id)
+}
 
 @Serializable
 class ChapterDto(
@@ -61,6 +79,7 @@ class MangaDto(
 }
 
 @Serializable
-class ImageListDto(
-    val data: List<String>? = null,
+class WebViewResultDto(
+    val needLogin: Boolean = false,
+    val urls: List<String> = emptyList(),
 )

@@ -1,105 +1,69 @@
 package eu.kanade.tachiyomi.extension.ru.desu
 
-import android.content.SharedPreferences
 import android.widget.Toast
-import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.asObservableSuccess
-import eu.kanade.tachiyomi.network.interceptor.rateLimitHost
 import eu.kanade.tachiyomi.source.ConfigurableSource
-import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import keiyoushi.utils.getPreferences
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.float
-import kotlinx.serialization.json.floatOrNull
-import kotlinx.serialization.json.int
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
-import kotlinx.serialization.json.long
+import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.network.rateLimit
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.firstInstanceOrNull
+import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.utils.parseAs
+import keiyoushi.utils.ratingStars
+import keiyoushi.utils.string
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import okhttp3.FormBody
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
-import rx.Observable
-import uy.kohesive.injekt.injectLazy
-import kotlin.text.matches
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
+import kotlin.time.Duration.Companion.seconds
 
-class Desu :
-    HttpSource(),
+@Source
+abstract class Desu :
+    KeiSource(),
     ConfigurableSource {
-    override val name = "Desu"
 
-    override val id: Long = 6684416167758830305
+    private val preferences by getPreferencesLazy()
 
-    private val preferences: SharedPreferences = getPreferences {
-        this.getString(DOMAIN_PREF, DOMAIN_DEFAULT)?.let { domain ->
-            if (!domain.matches(URL_REGEX)) {
-                this.edit()
-                    .putString(DOMAIN_PREF, DOMAIN_DEFAULT)
-                    .apply()
-            }
-        }
-        this.getString(DEFAULT_DOMAIN_PREF, null).let { prefDefaultDomain ->
-            if (prefDefaultDomain != DOMAIN_DEFAULT) {
-                this.edit()
-                    .putString(DOMAIN_PREF, DOMAIN_DEFAULT)
-                    .putString(DEFAULT_DOMAIN_PREF, DOMAIN_DEFAULT)
-                    .apply()
-            }
-        }
+    override fun Headers.Builder.configureHeaders() = apply {
+        set("User-Agent", "Mihon (+https://github.com/keiyoushi/extensions-source)")
     }
 
-    override val baseUrl = preferences.getString(DOMAIN_PREF, DOMAIN_DEFAULT)!!
-
-    override val lang = "ru"
-
-    override val supportsLatest = true
-
-    private val json: Json by injectLazy()
-
-    override fun headersBuilder() = Headers.Builder().apply {
-        add("User-Agent", "Tachiyomi")
-        add("Referer", baseUrl)
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = apply {
+        rateLimit(1, 2.seconds) { it.host == baseUrl.toHttpUrl().host }
     }
 
-    override val client: OkHttpClient =
-        network.cloudflareClient.newBuilder()
-            .rateLimitHost(baseUrl.toHttpUrl(), 3)
-            .build()
+    // ============================== Manga Details ===============================
+    private fun MangaDetDto.toSManga(
+        genresStr: String? = genres?.joinToString { it.name } ?: "",
+        authorsStr: String? = authors?.joinToString { it.name },
+    ): SManga {
+        val ratingValue = score?.value ?: 0.0f
 
-    private fun MangaDetDto.toSManga(genresStr: String? = "", authorsStr: String? = null): SManga {
-        val ratingValue = score!!
-        val ratingStar = when {
-            ratingValue > 9.5 -> "★★★★★"
-            ratingValue > 8.5 -> "★★★★✬"
-            ratingValue > 7.5 -> "★★★★☆"
-            ratingValue > 6.5 -> "★★★✬☆"
-            ratingValue > 5.5 -> "★★★☆☆"
-            ratingValue > 4.5 -> "★★✬☆☆"
-            ratingValue > 3.5 -> "★★☆☆☆"
-            ratingValue > 2.5 -> "★✬☆☆☆"
-            ratingValue > 1.5 -> "★☆☆☆☆"
-            ratingValue > 0.5 -> "✬☆☆☆☆"
-            else -> "☆☆☆☆☆"
-        }
-
-        val rawAgeStop = when (age_limit!!) {
+        val rawAgeStop = when (content_rating) {
             "no" -> ""
-            else -> age_limit.replace("_plus", "+")
+            else -> content_rating?.replace("_plus", "+") ?: ""
         }
 
-        val category = when (kind!!) {
+        val category = when (kind) {
             "manga" -> "Манга"
             "manhwa" -> "Манхва"
             "manhua" -> "Маньхуа"
@@ -112,31 +76,32 @@ class Desu :
 
         if (!synonyms.isNullOrEmpty()) {
             altName = "Альтернативные названия:\n" +
-                synonyms.replace("/", " / ") +
+                synonyms.joinToString(separator = " / ") +
                 "\n\n"
         }
 
-        return SManga.create().apply {
-            title = if (isEng.equals("rus")) {
+        return SManga.create().also { manga ->
+            manga.title = if (isEng.equals("rus")) {
                 russian
             } else {
                 name
             }
-            url = "/$id"
-            thumbnail_url = image.original
-            description = if (isEng.equals("rus")) {
+            manga.url = "/$id"
+            manga.thumbnail_url = cover.preview
+            val totalVotes = score?.votes ?: 0L
+            manga.description = if (isEng.equals("rus")) {
                 name
             } else {
                 russian
-            } + "\n" + ratingStar + " " + ratingValue + " (голосов: " +
-                score_users + ")\n" + altName + this@toSManga.description
-            genre = ("$category, $rawAgeStop, $genresStr").split(", ").filter { it.isNotEmpty() }.joinToString { it.trim() }
-            status = when (trans_status) {
+            } + "\n" + ratingStars(ratingValue.toDouble()) + " " + ratingValue + " (голосов: " +
+                totalVotes + ")\n" + altName + description
+            manga.genre = ("$category, $rawAgeStop, $genresStr").split(", ").filter { it.isNotEmpty() }.joinToString { it.trim() }
+            manga.status = when (trans_status) {
                 "continued" -> SManga.ONGOING
 
                 "completed" -> SManga.COMPLETED
 
-                else -> when (this@toSManga.status) {
+                else -> when (status) {
                     "ongoing" -> SManga.ONGOING
 
                     "released" -> SManga.COMPLETED
@@ -145,226 +110,224 @@ class Desu :
                     else -> SManga.UNKNOWN
                 }
             }
-            author = authorsStr
+            manga.author = authorsStr
         }
     }
 
-    override fun popularMangaRequest(page: Int) = GET("$baseUrl$API_URL/?limit=50&order=popular&page=$page", headers)
+    // ============================== Search ===============================
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        // Текстовий пошук: окремий запит /manga/search/, фільтри в ньому не діють
+        if (query.isNotEmpty()) return searchByQuery(page, query)
 
-    override fun popularMangaParse(response: Response) = searchMangaParse(response)
+        val order = filters.firstInstanceOrNull<OrderBy>()?.value ?: ORDER_VALUES[ORDER_POPULAR]
+        val types = filters.firstInstanceOrNull<TypeList>()?.state.orEmpty()
+            .filter { it.state }
+            .map { it.id }
+        val statuses = filters.firstInstanceOrNull<StatusList>()?.state.orEmpty()
+            .filter { it.state }
+            .map { it.id }
+        // жанри і теги разом: "id-slug" або "id-!slug" (виключення)
+        val genreParams = (
+            filters.firstInstanceOrNull<GenreList>()?.state.orEmpty() +
+                filters.firstInstanceOrNull<TagList>()?.state.orEmpty()
+            )
+            .filterNot { it.isIgnored() }
+            .map { it.toParam() }
 
-    override fun latestUpdatesRequest(page: Int) = GET("$baseUrl$API_URL/?limit=50&order=updated&page=$page", headers)
+        // Каталог (фільтри / сортування): парсинг HTML сторінки /manga/
+        val url = "$baseUrl/manga/".toHttpUrl().newBuilder().apply {
+            if (page > 1) addQueryParameter("page", page.toString())
+            if (statuses.isNotEmpty()) addQueryParameter("status", statuses.joinToString(","))
+            if (types.isNotEmpty()) addQueryParameter("kinds", types.joinToString(","))
+            if (genreParams.isNotEmpty()) addQueryParameter("genres", genreParams.joinToString(","))
+            addQueryParameter("order_by", order)
+        }.build()
 
-    override fun latestUpdatesParse(response: Response): MangasPage = searchMangaParse(response)
+        val document = client.get(url, Fetch.DOCUMENT).asJsoup()
+        return parseCatalog(document)
+    }
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl$API_URL/".toHttpUrl().newBuilder()
-            .addQueryParameter("limit", "20")
-            .addQueryParameter("page", page.toString())
+    // ============================== Text search ===============================
+    private suspend fun searchByQuery(page: Int, query: String): MangasPage {
+        // Сайт повертає всі результати одним списком, без пагінації
+        if (page > 1) return MangasPage(emptyList(), false)
 
-        val types = mutableListOf<Type>()
-        val genres = mutableListOf<Genre>()
-        (if (filters.isEmpty()) getFilterList() else filters).forEach { filter ->
-            when (filter) {
-                is OrderBy -> url.addQueryParameter("order", arrayOf("popular", "updated", "name")[filter.state])
-                is TypeList -> filter.state.forEach { type -> if (type.state) types.add(type) }
-                is GenreList -> filter.state.forEach { genre -> if (genre.state) genres.add(genre) }
-                else -> {}
+        val body = FormBody.Builder()
+            .add("q", query)
+            .add("type", "manga")
+            .add("_xfToken", "")
+            .add("_xfRequestUri", "/manga/")
+            .add("_xfNoRedirect", "1")
+            .add("_xfResponseType", "json")
+            .build()
+
+        val result = client.post(
+            url = "$baseUrl/manga/search/",
+            headers = headers.newBuilder()
+                .set("X-Requested-With", "XMLHttpRequest")
+                .set("X-Ajax-Referer", "$baseUrl/manga/")
+                .build(),
+            fetch = Fetch.XHR.from("/manga/"),
+            body = body,
+        ).parseAs<SearchDto>()
+
+        val doc = Jsoup.parseBodyFragment(result.templateHtml, baseUrl)
+        val mangas = doc.select("li.AniMangaSearchCard").mapNotNull { it.toSearchManga() }
+        return MangasPage(mangas, false)
+    }
+
+    private fun Element.toSearchManga(): SManga? {
+        val link = selectFirst("a.AniMangaSearchCard__link") ?: return null
+        // href: manga/slug.6423/ -> id = 6423
+        val id = link.attr("href").substringBefore('?').trimEnd('/').substringAfterLast('.')
+        if (id.isEmpty() || !id.all { it.isDigit() }) return null
+
+        val russianName = selectFirst(".AniMangaSearchCard__title")?.text()?.trim().orEmpty()
+        val originalName = selectFirst(".AniMangaSearchCard__subtitle")?.text()?.trim().orEmpty()
+
+        // x120 -> preview, щоб обкладинка була такою ж, як у каталозі
+        val cover = selectFirst("img.AniMangaSearchCard__cover")?.attr("src")
+            ?.replace("/covers/x120/", "/covers/preview/")
+            ?.takeIf { it.isNotEmpty() }
+
+        return SManga.create().apply {
+            url = "/$id"
+            title = if (isEng.equals("rus")) {
+                russianName.ifEmpty { originalName }
+            } else {
+                originalName.ifEmpty { russianName }
             }
+            thumbnail_url = cover
         }
-
-        if (types.isNotEmpty()) {
-            url.addQueryParameter("kinds", types.joinToString(",") { it.id })
-        }
-        if (genres.isNotEmpty()) {
-            url.addQueryParameter("genres", genres.joinToString(",") { it.id })
-        }
-        if (query.isNotEmpty()) {
-            url.addQueryParameter("search", query)
-        }
-        return GET(url.build(), headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage {
-        val page = json.decodeFromString<PageWrapperDto<MangaDetDto>>(response.body.string())
-        val mangas = page.response.map {
-            it.toSManga()
-        }
+    // ============================== Catalog parsing ===============================
+    private fun parseCatalog(document: Document): MangasPage {
+        val mangas = document.select("ol.memberList > li.memberListItem").mapNotNull { it.toCatalogManga() }
 
-        return MangasPage(mangas, page.pageNavParams.count > page.pageNavParams.page * page.pageNavParams.limit)
+        val hasNext = PAGE_COUNTER_REGEX.find(document.selectFirst("span.pageNavHeader")?.text() ?: document.text())?.let {
+            val (current, last) = it.destructured
+            current.toInt() < last.toInt()
+        } ?: (document.selectFirst("a:containsOwn(Вперёд)") != null)
+
+        return MangasPage(mangas, hasNext)
     }
 
-    private fun titleDetailsRequest(manga: SManga): Request = GET(baseUrl + API_URL + manga.url + "/", headers)
+    private fun Element.toCatalogManga(): SManga? {
+        val link = selectFirst("h3 a.animeTitle") ?: selectFirst("h3 a") ?: return null
+        // href відносний: manga/out.3365/ -> id = 3365
+        val id = link.attr("href").substringBefore('?').trimEnd('/').substringAfterLast('.')
+        if (id.isEmpty() || !id.all { it.isDigit() }) return null
 
-    // Workaround to allow "Open in browser" use the real URL.
-    override fun fetchMangaDetails(manga: SManga): Observable<SManga> = client.newCall(titleDetailsRequest(manga))
-        .asObservableSuccess()
-        .map { response ->
-            mangaDetailsParse(response).apply { initialized = true }
+        val originalName = link.text().trim()
+        // <div class="dimmed"><span>Русское название</span></div>; запасний варіант: title="Русское (Original)"
+        val russianName = selectFirst("div.dimmed span")?.text()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: link.attr("title").removeSuffix(" ($originalName)").ifEmpty { originalName }
+
+        // <span class="img" style="background-image: url('https://static.desu.uno/.../3674.jpg?1722258191');">
+        val cover = selectFirst("span.img")?.attr("style")
+            ?.let { COVER_REGEX.find(it)?.groupValues?.get(1) }
+            ?.let { if (it.startsWith("/")) baseUrl + it else it }
+
+        return SManga.create().apply {
+            url = "/$id"
+            title = if (isEng.equals("rus")) russianName else originalName
+            thumbnail_url = cover
         }
+    }
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET(baseUrl + "/manga" + manga.url, headers)
+    override suspend fun getPopularManga(page: Int) = getSearchMangaList(page, "", FilterList(OrderBy(ORDER_POPULAR)))
 
-    override fun mangaDetailsParse(response: Response) = SManga.create().apply {
-        val responseString = response.body.string()
-        val series = json.decodeFromString<SeriesWrapperDto<MangaDetDto>>(responseString)
-        val genresStr = json.decodeFromString<SeriesWrapperDto<MangaDetGenresDto>>(responseString).response.genres!!.joinToString { it.russian }
-        val authorsStr = if (responseString.contains("people_name")) {
-            json.decodeFromString<SeriesWrapperDto<MangaDetAuthorsDto>>(responseString).response.authors!!.joinToString { it.people_name }
+    override suspend fun getLatestUpdates(page: Int) = getSearchMangaList(page, "", FilterList(OrderBy(ORDER_UPDATED)))
+
+    // ============================== Manga/Chapters ===============================
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate = coroutineScope {
+        val mangaDeferred = if (fetchDetails) {
+            async {
+                val responseManga = client.get("$baseUrl$API_URL${manga.url}/", Fetch.XHR)
+                responseManga.parseAs<InfoWrapperDto<MangaDetDto>>().manga.toSManga()
+            }
         } else {
             null
         }
-        return series.response.toSManga(genresStr, authorsStr)
-    }
 
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val obj = json.parseToJsonElement(response.body.string())
-            .jsonObject["response"]!!
-            .jsonObject
-
-        val cid = obj["id"]!!.jsonPrimitive.int
-        val objChapter = obj["chapters"]!!
-        return objChapter.jsonObject["list"]!!.jsonArray.filterNot { it.jsonObject["vol"]!!.jsonPrimitive.floatOrNull!! == objChapter.jsonObject["last"]!!.jsonObject["vol"]!!.jsonPrimitive.float && it.jsonObject["ch"]!!.jsonPrimitive.floatOrNull!! > objChapter.jsonObject["last"]!!.jsonObject["ch"]!!.jsonPrimitive.float }.map {
-            val chapterObj = it.jsonObject
-            val ch = chapterObj["ch"]!!.jsonPrimitive.content
-            val vol = chapterObj["vol"]!!.jsonPrimitive.content
-            val fullNumStr = "$vol. Глава $ch"
-            val title = chapterObj["title"]!!.jsonPrimitive.contentOrNull ?: ""
-
-            SChapter.create().apply {
-                name = "$fullNumStr $title"
-                // #apiChapter - JSON API url to automatically delete when chapter is opened in browser
-                url = "/manga/$cid/vol$vol/ch$ch/rus" + "#apiChapter/$cid/chapter/${chapterObj["id"]!!.jsonPrimitive.int}"
-                chapter_number = ch.toFloatOrNull() ?: -1f
-                date_upload = chapterObj["date"]!!.jsonPrimitive.long * 1000L
-            }
-        }
-    }
-
-    override fun chapterListRequest(manga: SManga): Request = titleDetailsRequest(manga)
-
-    override fun pageListRequest(chapter: SChapter): Request = GET(baseUrl + API_URL + chapter.url.substringAfterLast("#apiChapter"), headers)
-
-    override fun getChapterUrl(chapter: SChapter): String = baseUrl + chapter.url.substringBeforeLast("#apiChapter")
-
-    override fun pageListParse(response: Response): List<Page> {
-        val obj = json.parseToJsonElement(response.body.string())
-            .jsonObject["response"]!!
-            .jsonObject
-
-        return obj["pages"]!!.jsonObject["list"]!!.jsonArray
-            .mapIndexed { i, jsonEl ->
-                Page(i, "", jsonEl.jsonObject["img"]!!.jsonPrimitive.content.replace(Regex("(?<=\\.)desu\\..+(?=/manga/)"), baseUrl.substringAfter("://")))
-            }
-    }
-
-    override fun imageUrlParse(response: Response) = throw UnsupportedOperationException()
-
-    private fun searchMangaByIdRequest(id: String): Request = GET("$baseUrl$API_URL/$id", headers)
-
-    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> {
-        if (query.startsWith("https://")) {
-            val url = query.toHttpUrl()
-            if (url.host != baseUrl.toHttpUrl().host) {
-                throw Exception("Unsupported url")
-            }
-            val titleid = url.pathSegments[1]
-            return fetchSearchManga(page, "$PREFIX_SLUG_SEARCH$titleid", filters)
-        }
-        return if (query.startsWith(PREFIX_SLUG_SEARCH)) {
-            val realQuery = query.removePrefix(PREFIX_SLUG_SEARCH)
-            client.newCall(searchMangaByIdRequest(realQuery))
-                .asObservableSuccess()
-                .map { response ->
-                    val details = mangaDetailsParse(response)
-                    details.url = "/$realQuery"
-                    MangasPage(listOf(details), false)
+        val chaptersDeferred = if (fetchChapters) {
+            async {
+                val responseChapter = client.get("$baseUrl$API_URL${manga.url}/chapters", Fetch.XHR)
+                val objChapter = responseChapter.parseAs<SeriesWrapperDto<List<ChaptersDto>>>().chapters
+                objChapter.map { chapter ->
+                    val fullNumStr = "${chapter.volume}. Глава ${chapter.number}"
+                    SChapter.create().apply {
+                        name = chapter.title?.let { "$fullNumStr $it" } ?: fullNumStr
+                        url = chapter.id.toString()
+                        memo = buildJsonObject {
+                            put("mangaUrl", manga.url)
+                            put("viewUrl", chapter.view_url)
+                        }
+                        chapter_number = chapter.number.toFloatOrNull() ?: -1f
+                        date_upload = chapter.publish_date.times(1000L)
+                    }
                 }
+            }
         } else {
-            client.newCall(searchMangaRequest(page, query, filters))
-                .asObservableSuccess()
-                .map { response ->
-                    searchMangaParse(response)
-                }
+            null
+        }
+
+        val finalManga = mangaDeferred?.await() ?: manga
+        val finalChapters = chaptersDeferred?.await() ?: chapters
+
+        SMangaUpdate(finalManga, finalChapters)
+    }
+
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga${manga.url}"
+
+    // ============================== Chapters Images ===============================
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val titleId = chapter.memo["mangaUrl"]!!.string.removePrefix("/")
+        val chapterId = chapter.url
+        val url = "$baseUrl$API_URL$titleId/chapters/$chapterId"
+
+        val response = client.get(url.toHttpUrl(), Fetch.XHR)
+
+        val result = response.parseAs<ChapterWrapperDto<ChapterDataDto>>()
+
+        return result.chapter.pages.mapIndexed { index, page ->
+            Page(index, imageUrl = page.url)
         }
     }
 
-    private class OrderBy :
-        Filter.Select<String>(
-            "Сортировка",
-            arrayOf("Популярность", "Дата", "Имя"),
-        )
+    override fun getChapterUrl(chapter: SChapter): String {
+        val viewUrl = chapter.memo["viewUrl"]?.string
+            ?: throw Exception("Обновите список глав!")
+        return viewUrl
+    }
 
-    private class GenreList(genres: List<Genre>) : Filter.Group<Genre>("Жанр", genres)
+    // =========================== Deeplink (Manga from Browser) ============================
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.host == baseUrl.toHttpUrl().host && url.pathSegments[0] == "manga" && url.pathSegments[1].length > 1) {
+            val tmpManga = SManga.create().apply {
+                this.url = "/${url.pathSegments[1].substringAfterLast(".")}"
+            }
+            return getMangaUpdate(tmpManga, emptyList(), fetchDetails = true, fetchChapters = false).manga
+        }
+        return null
+    }
 
-    private class TypeList(types: List<Type>) : Filter.Group<Type>("Тип", types)
-
-    private class Type(name: String, val id: String) : Filter.CheckBox(name)
-
-    private class Genre(name: String, val id: String) : Filter.CheckBox(name)
-
-    override fun getFilterList() = FilterList(
+    // ============================== Filters ===============================
+    override fun getFilterList(data: JsonElement?) = FilterList(
         OrderBy(),
         TypeList(getTypeList()),
+        StatusList(getStatusList()),
         GenreList(getGenreList()),
+        TagList(getTagList()),
     )
 
-    private fun getTypeList() = listOf(
-        Type("Манга", "manga"),
-        Type("Манхва", "manhwa"),
-        Type("Маньхуа", "manhua"),
-        Type("Ваншот", "one_shot"),
-        Type("Комикс", "comics"),
-    )
-
-    private fun getGenreList() = listOf(
-        Genre("Безумие", "Dementia"),
-        Genre("Боевые искусства", "Martial Arts"),
-        Genre("Вампиры", "Vampire"),
-        Genre("Военное", "Military"),
-        Genre("Гарем", "Harem"),
-        Genre("Демоны", "Demons"),
-        Genre("Детектив", "Mystery"),
-        Genre("Детское", "Kids"),
-        Genre("Дзёсей", "Josei"),
-        Genre("Додзинси", "Doujinshi"),
-        Genre("Драма", "Drama"),
-        Genre("Игры", "Game"),
-        Genre("Исторический", "Historical"),
-        Genre("Комедия", "Comedy"),
-        Genre("Космос", "Space"),
-        Genre("Магия", "Magic"),
-        Genre("Машины", "Cars"),
-        Genre("Меха", "Mecha"),
-        Genre("Музыка", "Music"),
-        Genre("Пародия", "Parody"),
-        Genre("Повседневность", "Slice of Life"),
-        Genre("Полиция", "Police"),
-        Genre("Приключения", "Adventure"),
-        Genre("Психологическое", "Psychological"),
-        Genre("Романтика", "Romance"),
-        Genre("Самураи", "Samurai"),
-        Genre("Сверхъестественное", "Supernatural"),
-        Genre("Сёдзе", "Shoujo"),
-        Genre("Сёдзе Ай", "Shoujo Ai"),
-        Genre("Сейнен", "Seinen"),
-        Genre("Сёнен", "Shounen"),
-        Genre("Сёнен Ай", "Shounen Ai"),
-        Genre("Смена пола", "Gender Bender"),
-        Genre("Спорт", "Sports"),
-        Genre("Супер сила", "Super Power"),
-        Genre("Триллер", "Thriller"),
-        Genre("Ужасы", "Horror"),
-        Genre("Фантастика", "Sci-Fi"),
-        Genre("Фэнтези", "Fantasy"),
-        Genre("Хентай", "Hentai"),
-        Genre("Школа", "School"),
-        Genre("Экшен", "Action"),
-        Genre("Этти", "Ecchi"),
-        Genre("Юри", "Yuri"),
-        Genre("Яой", "Yaoi"),
-    )
-
+    // ============================== Preference ===============================
     private var isEng: String? = preferences.getString(LANGUAGE_PREF, "eng")
 
     override fun setupPreferenceScreen(screen: androidx.preference.PreferenceScreen) {
@@ -381,37 +344,12 @@ class Desu :
                 true
             }
         }.let(screen::addPreference)
-        EditTextPreference(screen.context).apply {
-            key = DOMAIN_PREF
-            title = DOMAIN_TITLE
-            summary = baseUrl + "\n\nПо умолчанию: $DOMAIN_DEFAULT"
-            setDefaultValue(DOMAIN_DEFAULT)
-            setOnPreferenceChangeListener { _, newValue ->
-                if (!newValue.toString().matches(URL_REGEX)) {
-                    val warning = "Домен должен содаржать https:// или http://"
-                    Toast.makeText(screen.context, warning, Toast.LENGTH_LONG).show()
-                    return@setOnPreferenceChangeListener false
-                }
-                val warning = "Для смены домена необходимо перезапустить приложение с полной остановкой."
-                Toast.makeText(screen.context, warning, Toast.LENGTH_LONG).show()
-                true
-            }
-        }.let(screen::addPreference)
     }
 
     companion object {
-        const val PREFIX_SLUG_SEARCH = "slug:"
-
         private const val LANGUAGE_PREF = "DesuTitleLanguage"
-
-        private const val API_URL = "/manga/api"
-
-        private const val DOMAIN_TITLE = "Домен"
-        private const val DEFAULT_DOMAIN_PREF = "default_domain"
-        private const val DOMAIN_PREF = "DOMAIN_PREF"
-
-        private val URL_REGEX = Regex("^https?://.+")
-
-        private const val DOMAIN_DEFAULT = "https://desu.uno"
+        private const val API_URL = "/api/manga/"
+        private val PAGE_COUNTER_REGEX = Regex("""Страница\s+(\d+)\s+из\s+(\d+)""")
+        private val COVER_REGEX = Regex("""url\(['"]?([^'")]+)""")
     }
 }

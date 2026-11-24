@@ -1,103 +1,71 @@
 package eu.kanade.tachiyomi.extension.fr.scanmanga
 
-import android.annotation.SuppressLint
-import android.app.Application
-import android.os.Handler
-import android.os.Looper
+import android.content.ComponentName
+import android.content.Intent
 import android.util.Base64
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import androidx.preference.EditTextPreference
-import androidx.preference.PreferenceScreen
-import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.online.HttpSource
-import eu.kanade.tachiyomi.util.asJsoup
-import keiyoushi.utils.getPreferencesLazy
+import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.source.KeiSource
+import keiyoushi.source.SMangaUpdate
+import keiyoushi.utils.applicationContext
+import keiyoushi.utils.asJsoup
+import keiyoushi.utils.inflate
+import keiyoushi.utils.ownTextOrNull
 import keiyoushi.utils.parseAs
-import okhttp3.CookieJar
+import keiyoushi.utils.runWebView
+import keiyoushi.utils.toJsonString
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.Headers
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import okhttp3.Response
-import uy.kohesive.injekt.Injekt
-import uy.kohesive.injekt.api.get
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.zip.Inflater
+import org.jsoup.nodes.Document
+import java.io.IOException
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.TimeSource
 
-class ScanManga :
-    HttpSource(),
-    ConfigurableSource {
-    override val name = "Scan-Manga"
+@Source
+abstract class ScanManga : KeiSource() {
+    private val domain get() = baseUrl.toHttpUrl().topPrivateDomain()!!
+    private val baseImageUrl get() = "https://static.$domain/img/manga"
+    private val baseSearchUrl get() = "https://bqj.$domain/search/quick.json"
 
-    override val baseUrl = "https://m.scan-manga.com"
-    private val baseImageUrl = "https://static.scan-manga.com/img/manga"
-
-    override val lang = "fr"
-
-    override val supportsLatest = true
-
-    private val preferences by getPreferencesLazy()
-
-    override val client = super.client.newBuilder()
-        .addNetworkInterceptor { chain ->
-            val originalRequest = chain.request()
-            val header = originalRequest.header("X-Requested-With")
-            if (header != null && header.isEmpty()) {
-                return@addNetworkInterceptor chain.proceed(
-                    originalRequest.newBuilder()
-                        .removeHeader("X-Requested-With")
-                        .build(),
-                )
-            }
-            return@addNetworkInterceptor chain.proceed(originalRequest)
+    private val stripEmptyXRequestedWith = Interceptor { chain ->
+        val request = chain.request()
+        val header = request.header("X-Requested-With")
+        if (header != null && header.isEmpty()) {
+            chain.proceed(request.newBuilder().removeHeader("X-Requested-With").build())
+        } else {
+            chain.proceed(request)
         }
-        .build()
-
-    override fun headersBuilder(): Headers.Builder {
-        val currentChromeVersion = super.headersBuilder().build().get("User-Agent")?.let {
-            Regex("Chrome/(\\d+)").find(it)?.groupValues?.get(1)?.toIntOrNull()
-        } ?: 145
-
-        return Headers.Builder()
-//            .add(
-//                "sec-ch-ua",
-//                "\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"$currentChromeVersion\", \"Chromium\";v=\"$currentChromeVersion\"",
-//            )
-//            .add("sec-ch-ua-mobile", "?1")
-//            .add("sec-ch-ua-platform", "\"Android\"")
-            .add("upgrade-insecure-requests", "1")
-            .add(
-                "user-agent",
-                "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$currentChromeVersion.0.0.0 Mobile Safari/537.36",
-            )
-            .add(
-                "accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            )
-            .add("sec-fetch-site", "none")
-//            .add("sec-fetch-mode", "navigate")
-//            .add("sec-fetch-user", "?1")
-//            .add("sec-fetch-dest", "document")
-            .add("accept-language", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7")
-//            .add("priority", "u=0, i")
-            .add("X-Requested-With", "")
     }
 
-    // Popular
-    override fun popularMangaRequest(page: Int): Request = GET("$baseUrl/TOP-Manga-Webtoon-45.html", headers)
+    // A refused page image redirects to a valid placeholder PNG, which would otherwise be shown and downloaded as the page
+    private val rejectPlaceholder = Interceptor { chain ->
+        chain.proceed(chain.request()).also {
+            if ("/lelsec" in it.request.url.encodedPath) it.use { throw IOException("Le site a refusé l'image de cette page.") }
+        }
+    }
 
-    override fun popularMangaParse(response: Response): MangasPage {
-        val mangas = response.asJsoup().select("#carouselTOPContainer > div.top").map { element ->
+    override fun OkHttpClient.Builder.configureClient(): OkHttpClient.Builder = addNetworkInterceptor(stripEmptyXRequestedWith)
+        .addInterceptor(rejectPlaceholder)
+
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = add("accept-language", "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7")
+        .add("X-Requested-With", "")
+
+    // Popular
+    override suspend fun getPopularManga(page: Int): MangasPage {
+        val mangas = client.get("$baseUrl/TOP-Manga-Webtoon-47.html", Fetch.DOCUMENT).asJsoup().select("#carouselTOPContainer div.top").map { element ->
             SManga.create().apply {
                 val titleElement = element.selectFirst("a.atop")!!
 
@@ -111,12 +79,8 @@ class ScanManga :
     }
 
     // Latest
-    override fun latestUpdatesRequest(page: Int): Request = GET(baseUrl, headers)
-
-    override fun latestUpdatesParse(response: Response): MangasPage {
-        val document = response.asJsoup()
-
-        val mangas = document.select("#content_news .publi").map { element ->
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val mangas = client.get(baseUrl, Fetch.DOCUMENT).asJsoup().select("#content_news .publi").map { element ->
             SManga.create().apply {
                 val mangaElement = element.selectFirst("a.l_manga")!!
 
@@ -131,63 +95,76 @@ class ScanManga :
     }
 
     // Search
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
-        val url = "$baseUrl/api/search/quick.json"
-            .toHttpUrl().newBuilder()
+    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
+        if (url.topPrivateDomain() != domain || !MANGA_PATH_REGEX.matches(url.encodedPath)) return null
+
+        return mangaDetailsParse(client.get(baseUrl + url.encodedPath, Fetch.DOCUMENT).asJsoup()).apply {
+            this.url = url.encodedPath
+        }
+    }
+
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+        val url = baseSearchUrl.toHttpUrl().newBuilder()
             .addQueryParameter("term", query)
             .build()
-            .toString()
 
-        val newHeaders = headers.newBuilder()
+        val searchHeaders = headers.newBuilder()
             .add("Content-type", "application/json; charset=UTF-8")
             .build()
 
-        return GET(url, newHeaders)
-    }
-
-    override fun searchMangaParse(response: Response): MangasPage {
-        val json = response.body.string()
-        if (json == "[]") {
-            return MangasPage(emptyList(), false)
-        }
-
-        return MangasPage(
-            json.parseAs<MangaSearchDto>().title?.map {
+        // No results come back as `[]` instead of an object
+        val mangas = client.get(url, searchHeaders, Fetch.XHR).parseAs<MangaSearchDto> { if (it == "[]") """{"title":null}""" else it }
+            .title?.map {
                 SManga.create().apply {
-                    title = it.nom_match
+                    title = it.nomMatch
                     setUrlWithoutDomain(it.url)
                     thumbnail_url = "$baseImageUrl/${it.image}"
                 }
-            } ?: emptyList(),
-            false,
+            }.orEmpty()
+
+        return MangasPage(mangas, false)
+    }
+
+    // Details + chapters (same page)
+    override suspend fun fetchMangaUpdate(
+        manga: SManga,
+        chapters: List<SChapter>,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+    ): SMangaUpdate {
+        val document = client.get(getMangaUrl(manga), Fetch.DOCUMENT).asJsoup()
+        // chapterListParse throws for licensed series; don't let that break a details-only refresh
+        return SMangaUpdate(
+            mangaDetailsParse(document),
+            if (fetchChapters) chapterListParse(document) else chapters,
         )
     }
 
-    // Details
-    override fun mangaDetailsParse(response: Response): SManga {
-        val document = response.asJsoup()
-
-        return SManga.create().apply {
-            title = document.select("h1.main_title[itemprop=name]").text()
-            author = document.select("div[itemprop=author]").text()
-            description = document.selectFirst("div.titres_desc[itemprop=description]")?.text()
-            genre = document.selectFirst("div.titres_souspart span[itemprop=genre]")?.text()
-
-            val statutText = document.selectFirst("div.titres_souspart")?.ownText()
-            status = when {
-                statutText?.contains("En cours", ignoreCase = true) == true -> SManga.ONGOING
-                statutText?.contains("Terminé", ignoreCase = true) == true -> SManga.COMPLETED
-                else -> SManga.UNKNOWN
-            }
-
-            thumbnail_url = document.select("div.full_img_serie img[itemprop=image]").attr("src")
+    private fun mangaDetailsParse(document: Document): SManga = SManga.create().apply {
+        title = document.selectFirst("meta[itemprop=name]")!!.attr("content")
+        // The itemprop div only holds the "Auteur/Artiste" label
+        author = document.selectFirst("div[itemprop=author]")?.parent()?.ownTextOrNull()
+        description = document.selectFirst("div.titres_desc[itemprop=description]")?.text()
+        genre = document.selectFirst("span[itemprop=genre]")?.let { demo ->
+            (listOf(demo.text()) + demo.parent()?.ownText().orEmpty().split(","))
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .joinToString()
         }
+
+        val statutText = document.selectFirst("div.titres_souspart:has(div:containsOwn(Statut))")?.ownText()?.lowercase().orEmpty()
+        status = when {
+            "en cours" in statutText -> SManga.ONGOING
+            "terminé" in statutText -> SManga.COMPLETED
+            else -> SManga.UNKNOWN
+        }
+
+        thumbnail_url = document.selectFirst("meta[itemprop=image]")?.absUrl("content")
     }
 
-    // Chapters
-    override fun chapterListParse(response: Response): List<SChapter> {
-        val document = response.asJsoup()
-        return document.select("div.chapt_m").map { element ->
+    private fun chapterListParse(document: Document): List<SChapter> {
+        // Licensed series also list chapters hosted by external publishers (izneo, mangaplus, ono.live).
+        val chapters = document.select("div.chapt_m:has(td.publimg a[href*=/lecture-en-ligne/])").map { element ->
             val linkEl = element.selectFirst("td.publimg span.i a")!!
             val titleEl = element.selectFirst("td.publititle")
 
@@ -199,42 +176,18 @@ class ScanManga :
                 setUrlWithoutDomain(linkEl.absUrl("href"))
             }
         }
+
+        if (chapters.isEmpty() && document.selectFirst("div.chapt_m") != null) {
+            val platforms = document.select("a[href*=/plateforme-]").map { it.text() }.distinct()
+                .ifEmpty { listOf("le site de l'éditeur") }
+                .joinToString()
+            throw Exception("Licencié : chapitres disponibles uniquement sur $platforms")
+        }
+
+        return chapters
     }
 
     // Pages
-    private fun decodeHunter(obfuscatedJs: String): String {
-        val markers = markerManager::getMarkers
-
-        val (encoded, mask, intervalStr, optionStr) = runSafe {
-            Regex(markers().regexes.hunterObfuscation).find(obfuscatedJs)?.destructured
-                ?: error("Failed to match pattern")
-        }
-
-        val interval = intervalStr.toInt()
-        val option = optionStr.toInt()
-        val delimiter = mask[option]
-        val tokens = encoded.split(delimiter).filter { it.isNotEmpty() }
-        val reversedMap = mask.withIndex().associate { it.value to it.index }
-
-        return buildString {
-            for (token in tokens) {
-                // Reverse the hashIt() operation: convert masked characters back to digits
-                val digitString = token.map { c ->
-                    reversedMap[c]?.toString() ?: error("Invalid masked character: $c")
-                }.joinToString("")
-
-                // Convert from base `option` to decimal
-                val number = digitString.toIntOrNull(option)
-                    ?: error("Failed to parse token: $digitString as base $option")
-
-                // Reverse the shift done during encodeIt()
-                val originalCharCode = number - interval
-
-                append(originalCharCode.toChar())
-            }
-        }
-    }
-
     private val multipleSpaces = Regex("""\s+""")
 
     private fun dataAPI(data: String, idc: Int): UrlPayload {
@@ -242,212 +195,142 @@ class ScanManga :
             error("Received error response from data API: ${multipleSpaces.replace(data, " ").trim()}")
         }
 
-        // Step 1: Base64 decode the input
-        val compressedBytes = Base64.decode(data, Base64.NO_WRAP or Base64.NO_PADDING)
+        val inflated = String(Base64.decode(data, Base64.NO_WRAP or Base64.NO_PADDING).inflate())
 
-        // Step 2: Inflate (zlib decompress)
-        val inflater = Inflater()
-        inflater.setInput(compressedBytes)
-        val outputBuffer = ByteArray(512 * 1024) // 512 KB buffer, should be more than enough
-        val decompressedLength = inflater.inflate(outputBuffer)
-        inflater.end()
+        // Remove trailing hex string and reverse
+        val reversed = inflated.removeSuffix(idc.toString(16)).reversed()
 
-        val inflated = String(outputBuffer, 0, decompressedLength)
-
-        // Step 3: Remove trailing hex string and reverse
-        val hexIdc = idc.toString(16)
-        val cleaned = inflated.removeSuffix(hexIdc)
-        val reversed = cleaned.reversed()
-
-        // Step 4: Base64 decode and parse JSON
-        val finalJsonStr = String(Base64.decode(reversed, Base64.DEFAULT))
-
-        return finalJsonStr.parseAs<UrlPayload>()
+        return String(Base64.decode(reversed, Base64.DEFAULT)).parseAs<UrlPayload>()
     }
 
-    override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
-        val markers = markerManager::getMarkers
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val chapterUrl = getChapterUrl(chapter)
+        val chapterId = chapterUrl.substringAfterLast('_').substringBefore('.').toInt()
+        val lelCall = captureLelCall(chapterUrl, chapterId)
+            ?: throw Exception("Challenge Cloudflare. Résolvez-le dans la WebView, fermez-la et réessayez.")
 
-        val packedScript = runSafe { document.selectFirst(markers().selectors.packedScript)!!.data() }
-        val unpackedScript = decodeHunter(packedScript)
+        return dataAPI(sendLelCall(lelCall), chapterId)
+            .generateImageUrls()
+            .map { Page(it.first, url = chapterUrl, imageUrl = it.second) }
+    }
 
-        // parametersRegex
-        val (sml) = runSafe {
-            Regex(markers().regexes.smlParam).find(unpackedScript)?.destructured
-                ?: error("Failed to extract sml parameter.")
+    // The image host answers with a placeholder unless the Referer is the chapter page in full, as the reader sends it.
+    // Page lists cached before this have no url.
+    override fun getImageRequest(page: Page): Request = super.getImageRequest(page).run {
+        if (page.url.isEmpty()) this else newBuilder().header("Referer", page.url).build()
+    }
+
+    // The site answers app WebViews with a fake 404 on every request carrying their default value
+    private val siteOrigins get() = setOf("https://*.$domain")
+
+    private val webViewMutex = Mutex()
+
+    // A download queue fails its chapters within moments, which would otherwise load and show the challenge for each
+    private var challengeRetryAt = TimeSource.Monotonic.markNow()
+
+    /** Null while the user has to solve a challenge. */
+    private suspend fun captureLelCall(chapterUrl: String, chapterId: Int): LelCall? = webViewMutex.withLock {
+        if (challengeRetryAt.hasNotPassedNow()) return@withLock null
+
+        val lelCall = readLelCall(chapterUrl, chapterId)
+        if (lelCall == null) {
+            challengeRetryAt = TimeSource.Monotonic.markNow() + 3.seconds
+            openChallengeWebView(chapterUrl)
         }
+        lelCall
+    }
 
-        val (sme) = runSafe {
-            Regex(markers().regexes.smeParam).find(unpackedScript)?.destructured
-                ?: error("Failed to extract sme parameter.")
-        }
+    /**
+     * Cloudflare only accepts the reader's cf_clearance from a WebView, so the site's own reader runs in a hidden one
+     * and the lel call it makes is captured. Null as soon as a challenge shows up.
+     */
+    private suspend fun readLelCall(chapterUrl: String, chapterId: Int): LelCall? {
+        val bridge = List(16) { ('a'..'z').random() }.joinToString("")
 
-        val (chapterId) = runSafe {
-            Regex(markers().regexes.chapterInfo).find(packedScript)?.destructured
-                ?: error("Failed to extract chapter ID.")
-        }
-
-        val availableVariables = mapOf(
-            "sme" to sme,
-            "sml" to sml,
-            "fingerprint" to getFingerprint(),
-            "chapterId" to chapterId,
-            "topDomain" to (baseUrl.toHttpUrl().topPrivateDomain() ?: ""),
-        )
-
-        val mediaType = "application/json; charset=UTF-8".toMediaType()
-        val documentUrl = document.baseUri().toHttpUrl()
-
-        val lelResponse = runSafe {
-            val requestBody = injectVariables(markers().apiConfig.requestBody, availableVariables)
-            val pageListUrl = injectVariables(markers().apiConfig.pageListUrl, availableVariables)
-            val requestHeaders = headers.newBuilder()
-                .add("Origin", "${documentUrl.scheme}://${documentUrl.host}")
-                .add("Referer", documentUrl.toString())
-                .apply {
-                    markers().apiConfig.headers?.forEach { (key, value) ->
-                        add(key, injectVariables(value, availableVariables))
-                    }
+        return runWebView<LelCall?>(45.seconds) {
+            userAgent = headers["User-Agent"]!!
+            blockImages = true
+            setOriginMatchedHeader("X-Requested-With", "", siteOrigins)
+            webMessageBridge(bridge, siteOrigins) { message ->
+                val lelCall = message.parseAs<LelCall>()
+                // Third-party scripts share this page and can call the hook too
+                if (lelCall.url.toHttpUrlOrNull()?.topPrivateDomain() == domain) resolve(lelCall)
+            }
+            injectAtDocumentStart(lelHook(bridge, chapterId), siteOrigins)
+            onReceivedError { request, error ->
+                if (request.isForMainFrame) reject(Exception(error.description.toString()))
+            }
+            poll {
+                // On mature titles the reader only starts once this warning is accepted
+                evaluateJs("""[...document.querySelectorAll(".oui-avertissement-btn")].find((button) => button.offsetParent)?.click()""")
+                // "challenge", or the page's HTTP status once it has loaded: a challenge page is a 403 too
+                evaluateJs("""window._cf_chl_opt ? "challenge" : document.readyState == "complete" && performance.getEntriesByType("navigation")[0].responseStatus""") {
+                    if (it == "\"challenge\"") resolve(null)
+                    if ((it.toIntOrNull() ?: 0) >= 400) reject(Exception("Le site a répondu HTTP $it pour ce chapitre."))
                 }
-                .build()
-
-            val pageListRequest = POST(
-                url = pageListUrl,
-                headers = requestHeaders,
-                body = requestBody.toRequestBody(mediaType),
-            )
-
-            client.newBuilder().cookieJar(CookieJar.NO_COOKIES).build()
-                .newCall(pageListRequest).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        error("Unexpected error while fetching lel. HTTP ${response.code}")
-                    }
-                    dataAPI(response.body.string(), chapterId.toInt())
-                }
-        }
-
-        return lelResponse.generateImageUrls().map { Page(it.first, imageUrl = it.second) }
-    }
-
-    // Page
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
-
-    override fun imageRequest(page: Page): Request {
-        val imgHeaders = headers.newBuilder()
-            .add("Origin", baseUrl)
-            .build()
-
-        return GET(page.imageUrl!!, imgHeaders)
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun getFingerprint(): String {
-        var currentValue = preferences.getString("gpu_renderer", null)
-
-        if (currentValue.isNullOrEmpty()) {
-            val latch = CountDownLatch(1)
-            var returnValue = "SUMK" // Default to "IC" if something goes wrong
-
-            Handler(Looper.getMainLooper()).post {
-                val webView = WebView(Injekt.get<Application>())
-                webView.settings.javaScriptEnabled = true
-
-                webView.webViewClient = object : WebViewClient() {
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        val script = """
-                        (function() {
-                            try {
-                                const canvas = document.createElement("canvas");
-                                const gl = canvas.getContext("webgl");
-                                const debugInfo = gl ? gl.getExtension("WEBGL_debug_renderer_info") : null;
-                                const gpu = debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : "IC";
-
-                                return btoa(gpu);
-                            } catch (e) {
-                                return btoa("IC");
-                            }
-                        })();
-                        """.trimIndent()
-
-                        view?.evaluateJavascript(script) {
-                            returnValue = it?.removeSurrounding("\"") ?: "SUMK" // btoa("IC") = "SUMK"
-                            view.stopLoading()
-                            view.destroy()
-                            latch.countDown()
-                        }
-                    }
-                }
-                webView.loadUrl("about:blank")
             }
-
-            try {
-                latch.await(5, TimeUnit.SECONDS)
-            } catch (_: InterruptedException) {
-            }
-
-            val decodedValue = String(Base64.decode(returnValue, Base64.DEFAULT))
-
-            preferences.edit().putString("gpu_renderer", decodedValue).apply()
-            currentValue = decodedValue
+            loadUrl(chapterUrl)
         }
-
-        return Base64.encodeToString(
-            """{"gpu":"$currentValue","connection":"cellular"}""".toByteArray(),
-            Base64.NO_WRAP,
-        )
     }
 
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        EditTextPreference(screen.context).apply {
-            key = "gpu_renderer"
-            title = "Unmasked GPU renderer"
-            summary =
-                "Set and cache your GPU renderer string here to bypass fingerprint-based blocking. You can find your GPU renderer by visiting a site like https://www.browserleaks.com/webgl. Make sure to enter the exact string as shown on the site, without any extra spaces or characters and use Google Chrome on Android."
-            setDefaultValue(null)
-            dialogTitle = "GPU Renderer"
-            dialogMessage =
-                "Enter your GPU renderer string here. This is used to bypass blocking based on WebGL fingerprinting. You can find your GPU renderer by visiting a site like https://www.browserleaks.com/webgl using Google Chrome on Android. Make sure to enter the exact string as shown on the site, without any extra spaces or characters."
+    private fun lelHook(bridge: String, chapterId: Int) = """
+        (function () {
+            const original = window.fetch;
+            window.fetch = function (input, init) {
+                if (!String(input.url || input).includes("/lel/$chapterId.json")) return original.call(this, input, init);
+                const request = new Request(input, init);
+                request.text().then((body) => window.$bridge.postMessage(JSON.stringify({ url: request.url, headers: Object.fromEntries(request.headers), body })));
+                return new Promise(() => {});
+            };
+        })();
+    """.trimIndent()
 
-            setOnPreferenceChangeListener { _, newValue ->
-                preferences.edit().putString(key, newValue as String).commit()
+    /**
+     * Sends the captured call from a page on the API's origin, where it needs no CORS preflight. The API refuses the call
+     * from the app (HTTP 500, empty body) and the preflight from the chapter page, which WebView sends with its own
+     * X-Requested-With. The call itself needs `X-Requested-With: XMLHttpRequest`: any other value gets a 404.
+     */
+    private suspend fun sendLelCall(lelCall: LelCall): String {
+        val bridge = List(16) { ('a'..'z').random() }.joinToString("")
+        val apiOrigin = lelCall.url.toHttpUrl().run { "$scheme://$host" }
+
+        return runWebView(30.seconds) {
+            userAgent = headers["User-Agent"]!!
+            webMessageBridge(bridge, setOf(apiOrigin)) { message ->
+                val reply = message.parseAs<LelReply>()
+                if (reply.status == 200) resolve(reply.body) else reject(Exception("La liste des pages a été refusée (HTTP ${reply.status})."))
             }
-        }.also { screen.addPreference(it) }
-
-        EditTextPreference(screen.context).apply {
-            key = MarkerManager.PREF_MARKERS_JSON
-            title = "Debug: Markers JSON"
-            summary =
-                "For debugging purposes. Displays the raw JSON string of the markers used for decoding obfuscated scripts. Automatically updated when markers are refreshed."
-
-            setDefaultValue(null)
-            dialogTitle = "Markers JSON"
-            dialogMessage =
-                "This is the raw JSON string of the markers used for decoding obfuscated scripts. It is automatically updated when markers are refreshed. You can use this information for debugging purposes."
-
-            setOnPreferenceChangeListener { _, _ ->
-                // Do not allow manual changes, this is for display only
-                false
+            // The API answers HTTP 500 to calls carrying cookies
+            onPageFinished {
+                evaluateJs(
+                    """
+                    ((call) => fetch(call.url, { method: "POST", headers: { ...call.headers, "X-Requested-With": "XMLHttpRequest" }, body: call.body, credentials: "omit" })
+                        .then((response) => response.text().then((body) => ({ status: response.status, body })))
+                        .catch((error) => ({ status: 0, body: String(error) }))
+                        .then((reply) => window.$bridge.postMessage(JSON.stringify(reply))))(${lelCall.toJsonString()})
+                    """.trimIndent(),
+                )
             }
-        }.also { screen.addPreference(it) }
+            // Any page works, the root is a bare 403
+            loadUrl("$apiOrigin/")
+        }
     }
 
-    private val markerManager by lazy { MarkerManager(client, preferences) }
-
-    private fun injectVariables(template: String, variables: Map<String, String>): String {
-        var result = template
-        for ((key, value) in variables) {
-            result = result.replace("{$key}", value)
+    private fun openChallengeWebView(chapterUrl: String) {
+        val intent = Intent().apply {
+            component = ComponentName(applicationContext, "eu.kanade.tachiyomi.ui.webview.WebViewActivity")
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            putExtra("url_key", chapterUrl)
+            putExtra("source_key", id)
         }
-        return result
+        // Apps without this activity (Suwayomi etc.) still get the error message
+        runCatching { applicationContext.startActivity(intent) }
     }
 
-    fun <T> runSafe(fn: () -> T): T = runCatching { fn() }.getOrElse {
-        markerManager.fetchWithRetry()
+    // The reader downloads pages with fetch(); the image host blocks requests sent as images
+    override val imageFetch get() = Fetch.XHR
 
-        // Second attempt
-        runCatching { fn() }.getOrElse { throwable ->
-            markerManager.handleFatalFailure(throwable)
-        }
+    companion object {
+        private val MANGA_PATH_REGEX = Regex("""/\d+(?:-\d+)?/[^/]+\.html""")
     }
 }

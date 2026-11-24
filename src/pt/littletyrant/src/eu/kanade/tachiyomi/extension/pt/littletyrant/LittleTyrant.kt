@@ -1,90 +1,135 @@
 package eu.kanade.tachiyomi.extension.pt.littletyrant
 
 import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.POST
-import eu.kanade.tachiyomi.network.interceptor.rateLimit
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
-import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.util.asJsoup
+import keiyoushi.annotation.Source
+import keiyoushi.network.Fetch
+import keiyoushi.network.get
+import keiyoushi.network.post
+import keiyoushi.network.rateLimit
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.tryParse
+import okhttp3.Cookie
 import okhttp3.FormBody
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import rx.Observable
-import java.text.SimpleDateFormat
+import java.net.URLDecoder
+import java.nio.charset.StandardCharsets
+import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.time.Duration.Companion.seconds
 
-class LittleTyrant :
-    Madara(
-        "Little Tyrant",
-        "https://tiraninha.world",
-        "pt-BR",
-        dateFormat = SimpleDateFormat("MMM dd, yyyy", Locale("pt", "BR")),
-    ) {
-    override val client = super.client.newBuilder()
-        .rateLimit(3, 1)
-        .build()
+@Source
+abstract class LittleTyrant : Madara() {
+    override val chapterDateFormat = DateTimeFormatter.ofPattern("MMMM d, yyyy", Locale.forLanguageTag("pt-BR"))
 
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        addNetworkInterceptor(ImageDecoderInterceptor())
+        rateLimit(3, 1.seconds)
+    }
 
     // =============================== Popular =================================
 
-    override fun popularMangaSelector() = ".manga-grid .littletyrant-archive-item"
-
-    override val popularMangaUrlSelector = ".card-littletyrant a"
-
-    override fun popularMangaFromElement(element: Element) = SManga.create().apply {
-        title = element.selectFirst("h3")!!.text()
-        thumbnail_url = element.selectFirst("img")?.absUrl("src")
-        setUrlWithoutDomain(element.selectFirst(popularMangaUrlSelector)!!.absUrl("href"))
-    }
-
+    override fun archiveSelector() = "[id*=-entry-]"
+    override val archiveUrlSelector = ".card-info a"
+    override fun Element.postId() = id().substringAfterLast('-')
     // =============================== Details =================================
 
-    override val mangaDetailsSelectorGenre = ".manga-pills-minimal a"
-    override val mangaDetailsSelectorDescription = ".manga-summary-premium p"
-    override val mangaDetailsSelectorAuthor = ".manga-attributes-grid span:contains(AUTOR) + span"
-    override val mangaDetailsSelectorArtist = ".manga-attributes-grid span:contains(ARTISTA) + span"
-    override val mangaDetailsSelectorStatus = ".manga-attributes-grid span:contains(STATUS) + span"
+    override val mangaDetailsSelectorDescription = ".summary-text-scroll"
+    override val mangaDetailsSelectorAuthor = ".attr-label:contains(AUTOR) + .attr-value"
+    override val mangaDetailsSelectorArtist = ".attr-label:contains(ARTISTA) + .attr-value"
+    override val mangaDetailsSelectorStatus = ".attr-label:contains(STATUS) + .attr-value"
 
     // =============================== Chapters =================================
 
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable.fromCallable {
-        val document = client.newCall(mangaDetailsRequest(manga)).execute().asJsoup()
-        val mangaId = document.selectFirst("a.wp-manga-action-button")!!.attr("data-post")
+    override val chapterNameSelector = "[class*=-chapter-name]"
+    override val chapterDateSelector = "[class*=-chapter-date]"
+
+    override suspend fun fetchChapters(
+        mangaPath: String,
+        id: String,
+        mangaPage: Document?,
+    ): List<SChapter> {
         val chapters = mutableListOf<SChapter>()
         val url = "$baseUrl/wp-admin/admin-ajax.php"
         var offset = 0
         do {
             val form = FormBody.Builder()
                 .add("action", "load_more_chapters")
-                .add("manga_id", mangaId)
+                .add("manga_id", id)
                 .add("offset", offset.toString())
                 .build()
             offset += 12
-            val dto = client.newCall(POST(url, headers, form)).execute().parseAs<ChapterDto>()
+            val dto = client.post(url, Fetch.XHR.from(mangaPath), form).parseAs<ChapterDto>()
             val chapterElements = dto.toJsoup(baseUrl).select(chapterListSelector())
-            chapters += chapterElements.map(::chapterFromElement)
+            chapters += chapterElements.mapNotNull { chapterFromElement(it, mangaPath) }
         } while (!dto.isEmpty())
 
-        chapters.sortedByDescending(SChapter::chapter_number)
-    }
-
-    override fun chapterFromElement(element: Element) = SChapter.create().apply {
-        name = element.selectFirst(".chapter-name")!!.text()
-        date_upload = dateFormat.tryParse(element.selectFirst(".chapter-release-date")?.text())
-        // The source chapter list is out of order, so extract the number here for later sorting
-        CHAPTER_NUMBER_REGEX.find(name)?.groupValues?.last()?.let {
-            chapter_number = it.toFloat()
-        }
-        setUrlWithoutDomain(element.selectFirst(".chapter-card-link")!!.absUrl("href"))
+        return chapters.sortedByDescending(SChapter::chapter_number)
     }
 
     // =============================== Pages =================================
 
-    override val pageListParseSelector = ".reading-content img"
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val document = client.get(getChapterUrl(chapter), Fetch.DOCUMENT).asJsoup()
+
+        val script = document.selectFirst("script:containsData(_proxyUrls)")?.data()
+            ?: return emptyList()
+
+        val pages = PROXY_URLS_REGEX.find(script)?.groupValues?.last() ?: return emptyList()
+        val themePath = BASE_URL_PAGE_REGEX.find(script)?.groupValues?.last()
+            ?.replace("\\/", "/")
+            ?.toHttpUrlOrNull() ?: return emptyList()
+
+        val nonce = BROWSER_NONCE_REGEX.find(script)?.groupValues?.last() ?: return emptyList()
+        val token = getToken(themePath, nonce)
+
+        val baseUrl = "${themePath.scheme}://${themePath.host}"
+
+        return pages
+            .parseAs<List<String>>()
+            .mapIndexed { index, pathSegment ->
+                val decodePath = URLDecoder.decode(pathSegment, StandardCharsets.UTF_8.name())
+                val imageUrl = "$baseUrl$decodePath".toHttpUrl().newBuilder()
+                    .addQueryParameter("t_force", System.currentTimeMillis().toString())
+                    .fragment(token)
+                    .build().toString()
+                Page(index, imageUrl = imageUrl)
+            }
+    }
+
+    private suspend fun getToken(pageBaseUrl: HttpUrl, nonce: String): String {
+        val pageHeaders = headersBuilder()
+            .set("X-Reader-Sec", "tiraninha-web")
+            .build()
+        val url = pageBaseUrl.newBuilder()
+            .addPathSegment("gatekeeper.php")
+            .addQueryParameter("t", System.currentTimeMillis().toString())
+            .addQueryParameter("browser_nonce", nonce)
+            .build()
+        client.cookieJar.saveFromResponse(url, listOf(Cookie.parse(url, "lt_browser_nonce=$nonce; path=/")!!))
+        return client.get(url, pageHeaders, Fetch.XHR).body.string()
+    }
+
+    // =============================== Images =================================
+
+    override fun getImageRequest(page: Page): Request {
+        val imageHeaders = headers.newBuilder()
+            .set("X-Reader-Sec", "tiraninha-web")
+            .build()
+        return GET(page.imageUrl!!, imageHeaders)
+    }
 
     companion object {
-        private val CHAPTER_NUMBER_REGEX = """\d+(?:\.\d+)?""".toRegex()
+        private val PROXY_URLS_REGEX = """_proxyUrls\s*=\s*(\[[^]]+])""".toRegex(RegexOption.IGNORE_CASE)
+        private val BROWSER_NONCE_REGEX = """_browserNonce\s*=\s*"([^"]+)""".toRegex()
+        private val BASE_URL_PAGE_REGEX = """_themePath\s+=\s+"([^"]+)""".toRegex(RegexOption.IGNORE_CASE)
     }
 }

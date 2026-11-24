@@ -1,36 +1,39 @@
 package eu.kanade.tachiyomi.extension.en.asmotoon
 
-import eu.kanade.tachiyomi.multisrc.keyoapp.Keyoapp
+import eu.kanade.tachiyomi.multisrc.keyoapp.KeyoappV2
 import eu.kanade.tachiyomi.source.model.SManga
+import keiyoushi.annotation.Source
+import keiyoushi.utils.textOrNull
 import org.jsoup.nodes.Document
-import java.util.Locale
 
-class Asmotoon :
-    Keyoapp(
-        "Asmodeus Scans",
-        "https://asmotoon.com",
-        "en",
-    ) {
-    // filtering novel entries
-    override fun popularMangaSelector() = "div:contains(Trending) + div .group.overflow-hidden.grid:not(:has(.capitalize:contains(Novel)))"
-    override fun latestUpdatesSelector() = "div.grid > div.group:not(:has(.capitalize:contains(Novel)))"
-    override fun searchMangaSelector() = "#searched_series_page > button:not(:has(.capitalize:contains(Novel)))"
+@Source
+abstract class Asmotoon : KeyoappV2() {
+    override fun parseMangaDetails(document: Document, slug: String): SManga = super.parseMangaDetails(document, slug).apply {
+        // "By Author, Artist" -> "Author", "Artist"
+        // "By Author, Artist, Artist2" -> "Author", "Artist, Artist2"
+        val byText = document.selectFirst("p.l2-by")?.textOrNull()?.removePrefix("By ")?.trim()
+        if (byText != null) {
+            author = byText.substringBefore(",").trim()
+            val artistText = byText.substringAfter(",", "").trim()
+            if (artistText.isNotEmpty()) {
+                artist = artistText
+            }
+        }
 
-    override val descriptionSelector: String = "#expand_content"
-    override val genreSelector: String = ".gap-3 .gap-1 a"
+        // "Completed series", falling back to "Manga · Action · Completed"
+        val kickerText = (
+            document.selectFirst("p.l2-kicker")?.textOrNull()
+                ?: document.selectFirst("div.l2-meta span")?.textOrNull()
+            )?.lowercase()
 
-    override fun mangaDetailsParse(document: Document): SManga = super.mangaDetailsParse(document).apply {
-        genre = buildList {
-            document.selectFirst(typeSelector)?.text()?.replaceFirstChar {
-                if (it.isLowerCase()) {
-                    it.titlecase(
-                        Locale.ENGLISH,
-                    )
-                } else {
-                    it.toString()
-                }
-            }.let(::add)
-            document.select(genreSelector).forEach { add(it.text().removeSuffix(",")) }
-        }.joinToString()
+        if (kickerText != null) {
+            status = when {
+                "ongoing" in kickerText -> SManga.ONGOING
+                "completed" in kickerText -> SManga.COMPLETED
+                "dropped" in kickerText -> SManga.CANCELLED
+                "paused" in kickerText || "hiatus" in kickerText -> SManga.ON_HIATUS
+                else -> status
+            }
+        }
     }
 }

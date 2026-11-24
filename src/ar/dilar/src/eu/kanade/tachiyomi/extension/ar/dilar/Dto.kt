@@ -5,9 +5,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import kotlin.time.Instant
 
 // Series
 
@@ -21,6 +19,11 @@ class SeriesListDto(
 }
 
 @Serializable
+class RankingsDto(
+    val topSeries: List<SeriesDto>,
+)
+
+@Serializable
 class SeriesDto(
     private val id: String,
     private val title: String,
@@ -29,15 +32,16 @@ class SeriesDto(
     private val staff: List<StaffDto> = emptyList(),
     private val categories: List<NameDto> = emptyList(),
     @SerialName("translation_status") private val translationStatus: String? = null,
-    @SerialName("series_type_id") private val seriesTypeId: String? = null,
+    private val seriesType: SeriesTypeDto? = null,
 ) {
 
-    fun isNovel() = seriesTypeId == "99" // 99 is Novel ID
+    fun isNovel() = seriesType?.title == "رواية"
 
-    fun toSManga(createThumbnail: (String, String) -> String) = SManga.create().apply {
+    context(source: Dilar)
+    fun toSManga() = SManga.create().apply {
         title = this@SeriesDto.title
         url = "$id/$title"
-        thumbnail_url = cover?.let { createThumbnail(id, it) }
+        thumbnail_url = cover?.let { source.createThumbnail(id, it) }
         description = summary
 
         author = staff.filter { it.staff?.role == "Author" }.joinToString { it.name }
@@ -60,6 +64,11 @@ class StaffDto(
 )
 
 @Serializable
+class SeriesTypeDto(
+    val title: String,
+)
+
+@Serializable
 class RoleDto(val role: String? = null)
 
 // Search
@@ -68,6 +77,30 @@ class RoleDto(val role: String? = null)
 class SearchRequestDto(
     val query: String,
     val page: Int,
+    val seriesType: IncludeExcludeDto<String>,
+    val categories: IncludeExcludeDto<Int>,
+    val oneshot: Boolean,
+    val storyStatus: IncludeExcludeDto<String>,
+    val translationStatus: IncludeExcludeDto<String>,
+    val over17: Boolean?,
+)
+
+@Serializable
+class IncludeExcludeDto<T>(
+    val include: List<T>,
+    val exclude: List<T>,
+)
+
+@Serializable
+class CategoryGroupDto(
+    val name: String,
+    val categories: List<CategoryDto>,
+)
+
+@Serializable
+class CategoryDto(
+    val id: String,
+    val name: String,
 )
 
 @Serializable
@@ -100,12 +133,13 @@ class ReleaseDto(
     private val id: String,
     @SerialName("created_at") private val createdAt: String? = null,
 ) {
-    fun toSChapter(chapter: ChapterReleasesDto) = SChapter.create().apply {
+    fun toSChapter(chapter: ChapterReleasesDto, mangaUrl: String) = SChapter.create().apply {
         val title = if (!chapter.title.isNullOrBlank()) " - ${chapter.title}" else ""
         val number = chapter.chapter.removeSuffix(".00")
-        url = "$number#$id"
+        url = "$mangaUrl/$number#$id"
         name = "$number$title"
-        date_upload = dateFormat.tryParse(createdAt)
+        chapter_number = chapter.chapter.toFloatOrNull() ?: -1F
+        date_upload = Instant.tryParse(createdAt)
     }
 }
 
@@ -114,6 +148,7 @@ class ReleaseDto(
 @Serializable
 class PageListDto(
     @SerialName("storage_key") val storageKey: String,
+    @SerialName("media_token") val mediaToken: String,
     val pages: List<PageDto>,
 )
 
@@ -129,7 +164,3 @@ class PageDto(
 class NameDto(
     val name: String,
 )
-
-private val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.ROOT).apply {
-    timeZone = TimeZone.getTimeZone("UTC")
-}

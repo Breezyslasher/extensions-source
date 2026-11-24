@@ -1,19 +1,17 @@
 package eu.kanade.tachiyomi.extension.zh.bilimanga
 
 import android.content.Context
-import android.content.SharedPreferences
-import android.widget.Toast
-import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
+import androidx.preference.MultiSelectListPreference
 import androidx.preference.SwitchPreferenceCompat
 
 const val PREF_POPULAR_MANGA_DISPLAY = "POPULAR_MANGA_DISPLAY"
-const val PREF_RATE_LIMIT = "RATE_LIMIT"
-const val PREF_NOTICE = "NOTICE"
+const val PREF_DESCRIPTION = "DESCRIPTION"
+const val PREF_SOLVE_CAPTCHA = "SOLVE_CAPTCHA"
 
-val RATE_LIMIT_REGEX = Regex("^\\d+/\\d+$")
+val DEFAULT_SET = setOf("A", "B", "C")
 
-fun preferencesInternal(context: Context, pref: SharedPreferences) = arrayOf(
+fun preferencesInternal(context: Context) = arrayOf(
     ListPreference(context).apply {
         key = PREF_POPULAR_MANGA_DISPLAY
         title = "熱門漫畫顯示内容"
@@ -46,29 +44,19 @@ fun preferencesInternal(context: Context, pref: SharedPreferences) = arrayOf(
         )
         setDefaultValue("/top/weekvisit/%d.html")
     },
-    EditTextPreference(context).apply {
-        key = PREF_RATE_LIMIT
-        title = "請求速率限制"
-        summary = pref.getString(key, "10/10")!!.split("/")
-            .let { "每 ${it[1]} 秒内允許 ${it[0]} 个請求通過" }
-        dialogMessage = "請按照 */* 的格式輸入，例如 10/2 表示每 2 秒內允許 10 個請求通過，預設值為 10/10"
-        setDefaultValue("10/10")
-        setOnPreferenceChangeListener { _, newValue ->
-            if (RATE_LIMIT_REGEX.matches(newValue as String)) {
-                val split = newValue.split("/")
-                summary = "每 ${split[1]} 秒内允許 ${split[0]} 个請求通過"
-                Toast.makeText(context, "重啟應用後生效", Toast.LENGTH_LONG).show()
-                true
-            } else {
-                Toast.makeText(context, "格式錯誤！請檢查輸入", Toast.LENGTH_LONG).show()
-                false
-            }
-        }
+    MultiSelectListPreference(context).apply {
+        key = PREF_DESCRIPTION
+        title = "作品信息顯示偏好"
+        summary = "設定作品簡介中需要顯示的額外信息"
+        dialogTitle = "勾選需要顯示的信息"
+        entries = arrayOf("作品公告", "作品别名", "跳轉連結")
+        entryValues = arrayOf("A", "B", "C")
+        setDefaultValue(DEFAULT_SET)
     },
     SwitchPreferenceCompat(context).apply {
-        key = PREF_NOTICE
-        title = "顯示作品公告"
-        summary = "如果有，則在簡介里顯示該作品的公告通知"
-        setDefaultValue(true)
+        key = PREF_SOLVE_CAPTCHA
+        title = "自動輸入搜尋驗證碼"
+        summary = "搜尋需要驗證碼時自動識別並提交；關閉時需在 WebView 中手動驗證"
+        setDefaultValue(false)
     },
 )
