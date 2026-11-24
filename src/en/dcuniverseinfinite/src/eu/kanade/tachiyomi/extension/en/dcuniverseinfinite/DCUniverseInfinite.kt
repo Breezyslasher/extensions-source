@@ -1,7 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.dcuniverseinfinite
 
 import android.content.SharedPreferences
-import android.graphics.BitmapFactory
 import android.util.Base64
 import android.webkit.CookieManager
 import androidx.preference.EditTextPreference
@@ -21,10 +20,6 @@ import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.tryParse
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
@@ -165,13 +160,6 @@ class DCUniverseInfinite :
             title = "Hide chapters you can't read"
             summary = "Hide issues that need a subscription your account doesn't have. " +
                 "Checks each issue, so chapter lists load slower."
-            setDefaultValue(false)
-        }.also(screen::addPreference)
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_DEBUG
-            title = "Debug: show image size report"
-            summary = "Instead of opening an issue, show which preview image sizes the server returned. " +
-                "Contains no login details. Turn off to read."
             setDefaultValue(false)
         }.also(screen::addPreference)
     }
@@ -404,64 +392,10 @@ class DCUniverseInfinite :
         }
         if (previews.isEmpty()) throw IOException("No pages found for this issue.")
 
-        // Find the largest size the server will hand out for the preview images.
-        val results = SIZE_VARIANTS.map { variant ->
-            val url = variant.apply(previews.first())
-            VariantResult(variant, url, measureImage(url))
-        }
-        // maxByOrNull keeps the earliest of equal sizes, so "as given" wins ties.
-        val best = results
-            .maxByOrNull { r -> r.size?.let { it.first.toLong() * it.second } ?: -1L }
-            ?.takeIf { it.size != null }
-            ?.variant
-            ?: SIZE_VARIANTS.first()
-
-        if (preferences.getBoolean(PREF_DEBUG, false)) {
-            throw IOException(debugReport(firstBody, quality, rights.rights.hd_available, results, best))
-        }
-
-        return previews.mapIndexed { i, url -> Page(i, imageUrl = best.apply(url)) }
+        return previews.mapIndexed { i, url -> Page(i, imageUrl = url) }
     }
 
     private fun downloadRequest(page: Int, quality: String, headers: Headers): Request = GET("$apiUrl/comics/1/book/download/?page=$page&quality=$quality&trans=en", headers)
-
-    private class SizeVariant(val label: String, val apply: (String) -> String)
-
-    private class VariantResult(val variant: SizeVariant, val url: String, val size: Pair<Int, Int>?)
-
-    /** Returns width x height of the image at [url], or null if it didn't load as an image. */
-    private fun measureImage(url: String): Pair<Int, Int>? = runCatching {
-        client.newCall(imageRequest(Page(0, imageUrl = url))).execute().use { res ->
-            if (!res.isSuccessful) return@use null
-            val bytes = res.body.bytes()
-            val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opts)
-            if (opts.outWidth > 0 && opts.outHeight > 0) opts.outWidth to opts.outHeight else null
-        }
-    }.getOrNull()
-
-    // Kept short so it fits in the app's error message.
-    private fun debugReport(
-        manifestBody: String,
-        quality: String,
-        hdAvailable: Boolean,
-        results: List<VariantResult>,
-        chosen: SizeVariant,
-    ): String = buildString {
-        append("DEBUG hd=$hdAvailable q=$quality. ")
-        results.forEach { r ->
-            append("${r.variant.label}: ${r.size?.let { "${it.first}x${it.second}" } ?: "fail"}; ")
-        }
-        append("using ${chosen.label}. ")
-        results.firstOrNull()?.url?.toHttpUrl()?.let { u ->
-            append("host ${u.host}, query keys: ${u.queryParameterNames.joinToString().ifEmpty { "none" }}. ")
-        }
-        runCatching {
-            val img = Json.parseToJsonElement(manifestBody).jsonObject["images"]
-                ?.jsonArray?.firstOrNull() as? JsonObject
-            if (img != null) append("image keys: ${img.keys.joinToString()}")
-        }
-    }
 
     override fun imageRequest(page: Page): Request {
         val imageHeaders = super.headersBuilder()
@@ -539,24 +473,6 @@ class DCUniverseInfinite :
         private const val PER_PAGE = 20
         private const val PREF_SESSION_COOKIE = "pref_session_cookie"
         private const val PREF_HIDE_LOCKED = "pref_hide_locked"
-        private const val PREF_DEBUG = "debug_image_report"
-
-        private val SIZE_VARIANTS = listOf(
-            SizeVariant("as given") { it },
-            SizeVariant("w=2400") { it.withQuery("w" to "2400", "h" to null) },
-            SizeVariant("width=2400") { it.withQuery("width" to "2400", "height" to null) },
-            SizeVariant("no size params") {
-                it.withQuery("w" to null, "h" to null, "width" to null, "height" to null)
-            },
-        )
-
-        private fun String.withQuery(vararg params: Pair<String, String?>): String {
-            val builder = toHttpUrl().newBuilder()
-            params.forEach { (k, v) ->
-                if (v == null) builder.removeAllQueryParameters(k) else builder.setQueryParameter(k, v)
-            }
-            return builder.build().toString()
-        }
         private const val LEGACY_PREF_EMAIL = "pref_email"
         private const val LEGACY_PREF_PASSWORD = "pref_password"
         private const val LEGACY_PREF_LOGIN_TOKEN = "pref_login_token"
